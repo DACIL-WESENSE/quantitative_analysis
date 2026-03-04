@@ -14,8 +14,9 @@ a COPD exacerbation risk score for each patient.
 3. [Quickstart](#quickstart)
 4. [Step-by-step usage](#step-by-step-usage)
    - [Convert XLS files to CSV](#1-convert-xls-files-to-csv)
-   - [Run the main analysis pipeline](#2-run-the-main-analysis-pipeline)
-   - [Run the COPD risk scoring notebook](#3-run-the-copd-risk-scoring-notebook)
+   - [Convert BDF files to CSV/TSV](#2-convert-bdf-files-to-csvtsv)
+   - [Run the main analysis pipeline](#3-run-the-main-analysis-pipeline)
+   - [Run the COPD risk scoring notebook](#4-run-the-copd-risk-scoring-notebook)
 5. [Configuration reference](#configuration-reference)
 6. [Output reference](#output-reference)
 7. [COPD risk scoring](#copd-risk-scoring)
@@ -175,7 +176,43 @@ The script prints a summary:
 Done. Converted 1, skipped 1, errors 0.
 ```
 
-### 2. Run the main analysis pipeline
+### 2. Convert BDF files to CSV/TSV
+
+Biosemi BDF files (ECG recordings) can be converted to human-readable
+timeseries files with `bdf_to_csv.py`:
+
+```bash
+# Convert all .bdf files under ./data to CSV (one file per BDF)
+python bdf_to_csv.py
+
+# Write tab-separated files instead
+python bdf_to_csv.py --format tsv
+
+# Place all output files in a single directory
+python bdf_to_csv.py --output-dir ./output/ecg_raw
+
+# Export only specific channels
+python bdf_to_csv.py --channels Fp1 Fp2 Status
+
+# Re-convert even if an output file already exists
+python bdf_to_csv.py --overwrite
+
+# Preview what would be converted without writing any files
+python bdf_to_csv.py --dry-run
+```
+
+Each output file has one row per sample and the following columns:
+
+| Column     | Contents                                                                |
+|------------|-------------------------------------------------------------------------|
+| `time_s`   | Elapsed time in seconds from the start of the recording                 |
+| `<ch_name>`| Signal value in **µV** for EEG/ECG/EMG/EOG channels; native unit otherwise |
+| `status`   | Integer trigger / event code from the BDF Status channel                |
+
+The output file is placed alongside the source `.bdf` unless `--output-dir`
+is specified.
+
+### 3. Run the main analysis pipeline
 
 Open `main.ipynb` in Jupyter and **edit the configuration cell** near the top:
 
@@ -203,7 +240,7 @@ unsupervised ML analysis (PCA, K-Means, DBSCAN).
 Progress bars show throughput for each batch step.  Failed patients are
 logged to `pipeline.log` and skipped — they do not interrupt the pipeline.
 
-### 3. Run the COPD risk scoring notebook
+### 4. Run the COPD risk scoring notebook
 
 Open `copd_risk.ipynb` and set the same two path variables:
 
@@ -253,6 +290,17 @@ To change the clinical thresholds used for risk flagging, edit the
 | `--data-dir`  | `./data` | Directory to search recursively for `.xls` files |
 | `--overwrite` | off      | Re-convert even if a `.csv` already exists       |
 | `--dry-run`   | off      | Print what would be done without writing files   |
+
+### `bdf_to_csv.py`
+
+| Flag             | Default              | Description                                                              |
+|------------------|----------------------|--------------------------------------------------------------------------|
+| `--data-dir`     | `./data`             | Directory to search recursively for `.bdf` files                         |
+| `--output-dir`   | same as source BDF   | Directory to write output files                                          |
+| `--format`       | `csv`                | Output format: `csv` (comma-separated) or `tsv` (tab-separated)         |
+| `--channels`     | all data channels    | Whitelist of channel names to include in the output                      |
+| `--overwrite`    | off                  | Re-convert even if an output file already exists                         |
+| `--dry-run`      | off                  | Print what would be done without writing files                           |
 
 ---
 
