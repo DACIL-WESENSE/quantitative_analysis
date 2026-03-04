@@ -5,7 +5,7 @@ Reusable helper functions for the DACIL-WESENSE quantitative analysis pipeline.
 
 This module provides utilities for:
 - Directory parsing and file discovery
-- Data loading (XLS telemetry, BDF ECG)
+- Data loading (CSV telemetry, BDF ECG)
 - Data synchronization and cleaning
 - Exploratory data analysis (EDA)
 - Unsupervised machine learning (PCA, K-Means, DBSCAN)
@@ -101,8 +101,8 @@ def find_bdf_files(folder: Path) -> Tuple[Optional[Path], Optional[Path]]:
     return l1_path, l2_path
 
 
-def find_xls_file(folder: Path) -> Optional[Path]:
-    """Return the first ``.xls`` or ``.xlsx`` file found in *folder*.
+def find_csv_file(folder: Path) -> Optional[Path]:
+    """Return the first ``.csv`` file found in *folder*.
 
     Parameters
     ----------
@@ -112,13 +112,10 @@ def find_xls_file(folder: Path) -> Optional[Path]:
     Returns
     -------
     Optional[Path]
-        Path to the spreadsheet, or ``None`` if not found.
+        Path to the CSV file, or ``None`` if not found.
     """
-    for ext in ("*.xls", "*.xlsx"):
-        files = list(folder.glob(ext))
-        if files:
-            return files[0]
-    return None
+    files = list(folder.glob("*.csv"))
+    return files[0] if files else None
 
 
 # ---------------------------------------------------------------------------
@@ -126,19 +123,16 @@ def find_xls_file(folder: Path) -> Optional[Path]:
 # ---------------------------------------------------------------------------
 
 
-def load_telemetry(xls_path: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Load patient metadata and telemetry data from an XLS file.
+def load_telemetry(csv_path: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Load patient metadata and telemetry data from a CSV file.
 
-    The function attempts to read:
-    - A sheet containing patient info (Age, BMI, Weight, Gender).
-    - A sheet containing the time-series telemetry with stage annotations.
-
-    If the XLS contains a single sheet, both outputs are derived from it.
+    The function reads the CSV and uses the first row as headers.
+    Both ``info_df`` and ``telemetry_df`` are derived from the same file.
 
     Parameters
     ----------
-    xls_path : Path
-        Path to the ``.xls`` / ``.xlsx`` spreadsheet.
+    csv_path : Path
+        Path to the ``.csv`` file.
 
     Returns
     -------
@@ -146,26 +140,15 @@ def load_telemetry(xls_path: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
         ``(patient_info_df, telemetry_df)`` where *telemetry_df* has columns
         for every metric and a ``Stage`` column parsed from annotation rows.
     """
-    xls = pd.ExcelFile(xls_path, engine=_excel_engine(xls_path))
-    sheet_names = xls.sheet_names
+    raw = pd.read_csv(csv_path, header=0)
 
-    logger.debug("XLS sheets found: %s", sheet_names)
+    logger.debug("CSV rows loaded: %d", len(raw))
 
-    # Heuristic: first sheet is usually metadata / patient info.
-    info_df = pd.read_excel(xls, sheet_name=sheet_names[0], header=0)
+    info_df = raw
 
-    # If multiple sheets, try the second one for telemetry; otherwise reuse.
-    tele_sheet = sheet_names[1] if len(sheet_names) > 1 else sheet_names[0]
-    raw_tele = pd.read_excel(xls, sheet_name=tele_sheet, header=0)
-
-    telemetry_df = _parse_telemetry(raw_tele)
+    telemetry_df = _parse_telemetry(raw)
 
     return info_df, telemetry_df
-
-
-def _excel_engine(path: Path) -> str:
-    """Return the correct pandas Excel engine for *path*."""
-    return "xlrd" if path.suffix.lower() == ".xls" else "openpyxl"
 
 
 def _parse_telemetry(df: pd.DataFrame) -> pd.DataFrame:
