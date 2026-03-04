@@ -201,10 +201,10 @@ def _parse_telemetry(df: pd.DataFrame) -> pd.DataFrame:
 
     df["Stage"] = stage_col
 
-    # Drop rows that are purely annotation rows (non-numeric first numeric col).
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    if numeric_cols:
-        df = df.dropna(subset=[numeric_cols[0]])
+    # Drop rows that are purely annotation rows (non-numeric first column).
+    first_col = df.columns[0]
+    df[first_col] = pd.to_numeric(df[first_col], errors="coerce")
+    df = df.dropna(subset=[first_col])
 
     df.reset_index(drop=True, inplace=True)
     return df
@@ -1113,10 +1113,10 @@ def extract_copd_features(
     spo2_nadir = float("nan")
     spo2_drop = float("nan")
     if spo2_col:
-        spo2_series = pd.to_numeric(df[spo2_col], errors="coerce").dropna()
-        if not spo2_series.empty:
-            # Baseline: median of first 10 rows (resting / warm-up)
-            baseline_spo2 = float(spo2_series.head(10).median())
+        spo2_series = pd.to_numeric(df[spo2_col], errors="coerce")
+        if not spo2_series.dropna().empty:
+            # Baseline: median of first 10 chronological rows (resting / warm-up)
+            baseline_spo2 = float(spo2_series.head(10).dropna().median())
             spo2_nadir = float(
                 pd.to_numeric(active_df[spo2_col], errors="coerce").min()
             )
