@@ -94,13 +94,13 @@ Stage annotation rows are interspersed in the data.  Each annotation row
 contains one of the following keywords and labels all subsequent rows until
 the next annotation:
 
-| Keyword    | Meaning               |
-|------------|-----------------------|
-| `Opwarmen` | Warm-up               |
-| `Test`     | Incremental test      |
+| Keyword    | Meaning                 |
+|------------|-------------------------|
+| `Opwarmen` | Warm-up                 |
+| `Test`     | Incremental test        |
 | `VT1`      | Ventilatory threshold 1 |
 | `VT2`      | Ventilatory threshold 2 |
-| `Herstel`  | Recovery              |
+| `Herstel`  | Recovery                |
 
 The pipeline tolerates missing stages — if `VT1` or `VT2` rows are absent the
 corresponding features will be `NaN` or flagged accordingly.
@@ -188,13 +188,13 @@ Then **Run All** (`Kernel → Restart & Run All`).
 
 The pipeline runs the following steps for every patient folder:
 
-| Step | What it does |
-|------|-------------|
-| Load telemetry | Reads the CSV, parses stage annotations, returns a cleaned DataFrame |
-| Load ECG | Reads L1 / L2 BDF files with MNE; extracts mean amplitude and estimated HR |
-| Sync | Merges ECG features into the telemetry DataFrame |
-| Save | Writes `<patient_id>_telemetry.csv` to `output/<patient_id>/` |
-| Summarise | Appends a row to the master summary |
+| Step           | What it does                                                               |
+|----------------|----------------------------------------------------------------------------|
+| Load telemetry | Reads the CSV, parses stage annotations, returns a cleaned DataFrame       |
+| Load ECG       | Reads L1 / L2 BDF files with MNE; extracts mean amplitude and estimated HR |
+| Sync           | Merges ECG features into the telemetry DataFrame                           |
+| Save           | Writes `<patient_id>_telemetry.csv` to `output/<patient_id>/`              |
+| Summarise      | Appends a row to the master summary                                        |
 
 After batch processing, the notebook produces EDA plots (stage profiles,
 V-slope, RER trajectory, HRR), a cross-patient correlation heatmap, and
@@ -225,22 +225,22 @@ Then **Run All**.  For each patient it:
 
 ### `main.ipynb`
 
-| Variable | Location | Default | Description |
-|----------|----------|---------|-------------|
-| `DATA_ROOT` | Cell 2 | `"data"` | Root directory containing patient sub-folders |
-| `OUTPUT_ROOT` | Cell 2 | `"output"` | Base output directory |
-| `EDA_METRICS` | EDA section | `["HR", "VO2", "VCO2", "Power", "RER", "SpO2"]` | Metrics shown in per-patient stage plots |
-| `CORR_CANDIDATES` | Correlation section | `["HR", "VO2", ...]` | Columns included in the pooled correlation heatmap |
-| `N_CLUSTERS` | K-Means cell | `4` | Number of K-Means clusters — adjust after inspecting the elbow plot |
-| `eps` | DBSCAN cell | `1.0` | DBSCAN neighbourhood radius (in standard-deviation units) |
-| `min_samples` | DBSCAN cell | `5` | DBSCAN minimum neighbourhood size |
+| Variable          | Location            | Default                                         | Description                                                         |
+|-------------------|---------------------|-------------------------------------------------|---------------------------------------------------------------------|
+| `DATA_ROOT`       | Cell 2              | `"data"`                                        | Root directory containing patient sub-folders                       |
+| `OUTPUT_ROOT`     | Cell 2              | `"output"`                                      | Base output directory                                               |
+| `EDA_METRICS`     | EDA section         | `["HR", "VO2", "VCO2", "Power", "RER", "SpO2"]` | Metrics shown in per-patient stage plots                            |
+| `CORR_CANDIDATES` | Correlation section | `["HR", "VO2", ...]`                            | Columns included in the pooled correlation heatmap                  |
+| `N_CLUSTERS`      | K-Means cell        | `4`                                             | Number of K-Means clusters — adjust after inspecting the elbow plot |
+| `eps`             | DBSCAN cell         | `1.0`                                           | DBSCAN neighbourhood radius (in standard-deviation units)           |
+| `min_samples`     | DBSCAN cell         | `5`                                             | DBSCAN minimum neighbourhood size                                   |
 
 ### `copd_risk.ipynb`
 
-| Variable | Location | Default | Description |
-|----------|----------|---------|-------------|
-| `DATA_ROOT` | Cell 2 | `"data"` | Root directory containing patient sub-folders |
-| `OUTPUT_ROOT` | Cell 2 | `"output"` | Base output directory |
+| Variable      | Location | Default    | Description                                   |
+|---------------|----------|------------|-----------------------------------------------|
+| `DATA_ROOT`   | Cell 2   | `"data"`   | Root directory containing patient sub-folders |
+| `OUTPUT_ROOT` | Cell 2   | `"output"` | Base output directory                         |
 
 To change the clinical thresholds used for risk flagging, edit the
 `_COPD_THRESHOLDS` dictionary in `functions.py` (see
@@ -248,11 +248,11 @@ To change the clinical thresholds used for risk flagging, edit the
 
 ### `xls_to_csv.py`
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--data-dir` | `./data` | Directory to search recursively for `.xls` files |
-| `--overwrite` | off | Re-convert even if a `.csv` already exists |
-| `--dry-run` | off | Print what would be done without writing files |
+| Flag          | Default  | Description                                      |
+|---------------|----------|--------------------------------------------------|
+| `--data-dir`  | `./data` | Directory to search recursively for `.xls` files |
+| `--overwrite` | off      | Re-convert even if a `.csv` already exists       |
+| `--dry-run`   | off      | Print what would be done without writing files   |
 
 ---
 
@@ -292,24 +292,24 @@ start a fresh log, delete the file before running.
 compared against the threshold below; a flag of `1` means the value is in the
 range associated with elevated COPD risk.
 
-| Marker | CSV column(s) | Flag condition | Threshold | Source |
-|--------|--------------|---------------|-----------|--------|
-| Peak VO₂/kg | `V'O2` ÷ weight | `< threshold` | 20 mL/min/kg | ATS/ACCP 2003 |
-| VE/VCO₂ slope | `V'E`, `V'CO2` (linear regression) | `> threshold` | 34 | Puente-Maestu *et al.* ERJ 2016 |
-| SpO₂ nadir | `SpO2` | `< threshold` | 95 % | ATS/ERS |
-| SpO₂ drop | baseline − nadir | `≥ threshold` | 4 pp | ATS/ERS |
-| Peak breathing frequency | `BF` | `> threshold` | 40 br/min | Wasserman 5th ed. |
-| Peak RER | `RER` | `< threshold` | 1.0 | Wasserman 5th ed. |
-| Peak O₂ pulse | `VO2/HR` | `< threshold` | 10 mL/beat | Wasserman 5th ed. |
-| VT1 presence | `Stage == "VT1"` | absent (= 0) | — | — |
+| Marker                   | CSV column(s)                      | Flag condition | Threshold    | Source                          |
+|--------------------------|------------------------------------|----------------|--------------|---------------------------------|
+| Peak VO₂/kg              | `V'O2` ÷ weight                    | `< threshold`  | 20 mL/min/kg | ATS/ACCP 2003                   |
+| VE/VCO₂ slope            | `V'E`, `V'CO2` (linear regression) | `> threshold`  | 34           | Puente-Maestu *et al.* ERJ 2016 |
+| SpO₂ nadir               | `SpO2`                             | `< threshold`  | 95 %         | ATS/ERS                         |
+| SpO₂ drop                | baseline − nadir                   | `≥ threshold`  | 4 pp         | ATS/ERS                         |
+| Peak breathing frequency | `BF`                               | `> threshold`  | 40 br/min    | Wasserman 5th ed.               |
+| Peak RER                 | `RER`                              | `< threshold`  | 1.0          | Wasserman 5th ed.               |
+| Peak O₂ pulse            | `VO2/HR`                           | `< threshold`  | 10 mL/beat   | Wasserman 5th ed.               |
+| VT1 presence             | `Stage == "VT1"`                   | absent (= 0)   | —            | —                               |
 
 **Composite score:**
 
 | n\_flags | Risk level |
-|---------|-----------|
-| 0 | Low |
-| 1–2 | Moderate |
-| ≥ 3 | High |
+|----------|------------|
+| 0        | Low        |
+| 1–2      | Moderate   |
+| ≥ 3      | High       |
 
 To change any threshold, edit `_COPD_THRESHOLDS` in `functions.py`.  The
 baseline SpO₂ is computed as the median of the first 10 data rows
