@@ -135,7 +135,7 @@ conda activate quantitative_analysis
 python xls_to_csv.py
 
 # 4. Open the main pipeline and run all cells
-jupyter notebook main.ipynb
+jupyter notebook cpet.ipynb
 
 # 5. (Optional) Run the COPD risk scoring notebook
 jupyter notebook copd_risk.ipynb
