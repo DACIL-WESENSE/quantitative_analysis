@@ -42,6 +42,37 @@ mne.set_log_level("WARNING")
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Runtime configuration
+# ---------------------------------------------------------------------------
+
+_USE_GPU: bool = False
+
+
+def configure(*, use_gpu: bool = False) -> None:
+    """Set runtime options for the functions module.
+
+    Parameters
+    ----------
+    use_gpu : bool
+        If ``True``, attempt to use CuPy for GPU-accelerated signal
+        processing (e.g. ECG autocorrelation).  Silently falls back to
+        NumPy when CuPy is not installed or no CUDA device is available.
+    """
+    global _USE_GPU
+    _USE_GPU = use_gpu
+    if use_gpu:
+        try:
+            import cupy as cp  # noqa: F401
+            logger.info("GPU mode enabled (CuPy %s).", cp.__version__)
+        except ImportError:
+            logger.warning(
+                "configure(use_gpu=True) requested but cupy is not installed; "
+                "falling back to CPU."
+            )
+            _USE_GPU = False
+
+
+# ---------------------------------------------------------------------------
 # Stage annotation helpers
 # ---------------------------------------------------------------------------
 
@@ -185,22 +216,18 @@ def _parse_telemetry(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Identify stage-annotation rows by checking every cell.
-    stage_col: List[Optional[str]] = []
-    current_stage: Optional[str] = None
+    # Build a lower-case string representation of every row in one pass.
+    row_text = df.astype(str).agg(" ".join, axis=1).str.lower()
 
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="Parsing telemetry", leave=False):
-        row_text = " ".join(str(v) for v in row.values)
-        matched = None
-        for stage in STAGE_ORDER:
-            if stage.lower() in row_text.lower():
-                matched = stage
-                break
-        if matched:
-            current_stage = matched
-        stage_col.append(current_stage)
+    # Assign stage labels to annotation rows.  Iterate stages in reverse so
+    # that earlier entries in STAGE_ORDER take priority (overwrite later ones).
+    stage_series = pd.Series(pd.NA, index=df.index, dtype="object")
+    for stage in reversed(STAGE_ORDER):
+        mask = row_text.str.contains(stage.lower(), regex=False, na=False)
+        stage_series[mask] = stage
 
-    df["Stage"] = stage_col
+    # Forward-fill so every data row inherits the most recent stage label.
+    df["Stage"] = stage_series.ffill()
 
     # Drop rows that are purely annotation rows (non-numeric first column).
     first_col = df.columns[0]
@@ -342,8 +369,24 @@ def _estimate_hr_from_signal(signal: np.ndarray, sfreq: float) -> float:
     try:
         # Band-pass rough filtering using diff as a quick proxy.
         diff_signal = np.diff(signal)
-        acorr = np.correlate(diff_signal, diff_signal, mode="full")
-        acorr = acorr[len(acorr) // 2 :]
+
+        # Compute autocorrelation via FFT: O(n log n) vs O(n²) for np.correlate.
+        if _USE_GPU:
+            try:
+                import cupy as cp
+                sig_gpu = cp.asarray(diff_signal)
+                n = len(sig_gpu)
+                fft_sig = cp.fft.rfft(sig_gpu, n=2 * n)
+                acorr = cp.asnumpy(cp.fft.irfft(fft_sig * cp.conj(fft_sig)))[:n]
+            except Exception:
+                # Fall back to CPU if CuPy fails at runtime.
+                n = len(diff_signal)
+                fft_sig = np.fft.rfft(diff_signal, n=2 * n)
+                acorr = np.fft.irfft(fft_sig * np.conj(fft_sig))[:n]
+        else:
+            n = len(diff_signal)
+            fft_sig = np.fft.rfft(diff_signal, n=2 * n)
+            acorr = np.fft.irfft(fft_sig * np.conj(fft_sig))[:n]
 
         # Search for the first peak beyond 0.3 s (200 bpm max).
         min_lag = int(0.3 * sfreq)
@@ -388,6 +431,106 @@ def sync_ecg_with_telemetry(
         out["ecg_estimated_hr_bpm"] = ecg_features["estimated_hr_bpm"].mean()
 
     return out
+
+
+def process_patient(
+    folder: Path,
+    output_base: Path,
+    use_ecg_checkpoint: bool = True,
+) -> Optional[Dict]:
+    """Run the full pipeline for a single patient folder.
+
+    This is the parallelisable unit of Step 4.  It loads telemetry,
+    optionally loads / extracts ECG features, synchronises the two
+    data sources, saves the cleaned CSV, and returns a summary dict.
+
+    Parameters
+    ----------
+    folder : Path
+        Patient folder containing a ``.csv`` telemetry file and optional
+        ``.bdf`` ECG files.
+    output_base : Path
+        Root output directory; a per-patient sub-directory is created
+        automatically.
+    use_ecg_checkpoint : bool
+        When ``True``, load cached ECG features from disk if available,
+        skipping BDF reprocessing.
+
+    Returns
+    -------
+    Optional[Dict]
+        Dict with keys ``patient_id`` (str), ``summary_row`` (dict),
+        ``telemetry_df`` (DataFrame).  Returns ``None`` and logs an error
+        if processing fails.
+    """
+    patient_id = folder.name
+    logger.info("Processing patient: %s", patient_id)
+    patient_out = output_base / patient_id
+
+    try:
+        # ── Load CSV ──────────────────────────────────────────────────────
+        csv_path = find_csv_file(folder)
+        if csv_path is None:
+            raise FileNotFoundError(f"No CSV file found in {folder}")
+
+        info_df, telemetry_df = load_telemetry(csv_path)
+        logger.info("  %s — telemetry: %d rows × %d cols",
+                    patient_id, *telemetry_df.shape)
+
+        # ── Load / extract ECG features ───────────────────────────────────
+        l1_path, l2_path = find_bdf_files(folder)
+        ecg_features_list = []
+
+        for bdf_label, bdf_path in [("L1", l1_path), ("L2", l2_path)]:
+            if bdf_path is None:
+                logger.warning("  %s — %s BDF not found.", patient_id, bdf_label)
+                continue
+
+            feats = None
+            if use_ecg_checkpoint:
+                feats = load_ecg_checkpoint(patient_out, bdf_label)
+
+            if feats is None:
+                raw = load_ecg(bdf_path)
+                if raw is not None:
+                    feats = extract_ecg_features(raw)
+                    save_ecg_checkpoint(feats, patient_out, bdf_label)
+
+            if feats is not None:
+                feats = feats.copy()
+                feats["bdf_label"] = bdf_label
+                ecg_features_list.append(feats)
+
+        ecg_features = (
+            pd.concat(ecg_features_list, ignore_index=True)
+            if ecg_features_list
+            else pd.DataFrame()
+        )
+
+        # ── Synchronise ECG + telemetry ───────────────────────────────────
+        telemetry_df = sync_ecg_with_telemetry(ecg_features, telemetry_df)
+
+        # ── Save cleaned CSV ──────────────────────────────────────────────
+        save_telemetry_csv(telemetry_df, patient_id, patient_out)
+
+        # ── Build summary row ─────────────────────────────────────────────
+        summary_row = build_patient_summary(
+            patient_id,
+            info_df,
+            telemetry_df,
+            ecg_features if not ecg_features.empty else None,
+        )
+
+        logger.info("  %s — done.", patient_id)
+        return {
+            "patient_id": patient_id,
+            "summary_row": summary_row,
+            "telemetry_df": telemetry_df,
+        }
+
+    except Exception as exc:
+        logger.error("  FAILED for patient '%s': %s", patient_id, exc, exc_info=True)
+        return None
 
 
 # ---------------------------------------------------------------------------
