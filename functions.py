@@ -461,6 +461,97 @@ def extract_ecg_timeseries(
     return pd.DataFrame(rows)
 
 
+def extract_ecg_timeseries_array(
+    data: np.ndarray,
+    sfreq: float,
+    channel_names: Optional[List[str]] = None,
+    window_duration: float = 30.0,
+) -> pd.DataFrame:
+    """Extract time-resolved ECG features from a raw NumPy array.
+
+    Equivalent to :func:`extract_ecg_timeseries` but accepts a plain NumPy
+    array instead of an MNE Raw object, making it compatible with any BDF
+    loader (e.g. *pybdf*).
+
+    Parameters
+    ----------
+    data : np.ndarray
+        2-D array of shape ``(n_channels, n_samples)`` containing the ECG
+        signal in physical units (e.g. µV or mV).
+    sfreq : float
+        Sampling frequency in Hz.
+    channel_names : list of str, optional
+        Labels for each row of *data*.  Defaults to ``["ch0", "ch1", …]``.
+    window_duration : float
+        Duration of each analysis window in seconds (default 30 s).
+
+    Returns
+    -------
+    pd.DataFrame
+        Same columns as :func:`extract_ecg_timeseries`:
+        ``time_s``, ``channel``, ``hr_bpm``, ``rmssd_ms``, ``sdnn_ms``,
+        ``lf_ms2``, ``hf_ms2``, ``lf_hf_ratio``, ``breathing_rate_bpm``.
+    """
+    if data.ndim == 1:
+        data = data[np.newaxis, :]
+
+    n_channels, total_samples = data.shape
+    if channel_names is None:
+        channel_names = [f"ch{i}" for i in range(n_channels)]
+
+    window_samples = max(1, int(window_duration * sfreq))
+    rows: List[Dict] = []
+    nan = float("nan")
+
+    for ch_idx in range(n_channels):
+        ch_name = channel_names[ch_idx]
+        full_signal = data[ch_idx].astype(float)
+
+        all_r_peaks = _detect_r_peaks(full_signal, sfreq)
+
+        for win_start in range(0, total_samples, window_samples):
+            win_stop = min(win_start + window_samples, total_samples)
+            centre_s = (win_start + win_stop) / 2.0 / sfreq
+
+            mask = (all_r_peaks >= win_start) & (all_r_peaks < win_stop)
+            win_peaks = all_r_peaks[mask]
+
+            if len(win_peaks) < 10:
+                rows.append(
+                    dict(
+                        time_s=centre_s, channel=ch_name,
+                        hr_bpm=nan, rmssd_ms=nan, sdnn_ms=nan,
+                        lf_ms2=nan, hf_ms2=nan, lf_hf_ratio=nan,
+                        breathing_rate_bpm=nan,
+                    )
+                )
+                continue
+
+            rr_ms = np.diff(win_peaks) / sfreq * 1000.0
+            median_rr_s = float(np.median(rr_ms)) / 1000.0
+            hr_bpm = 60.0 / median_rr_s if median_rr_s > 0 else nan
+
+            hrv = _compute_hrv_metrics(rr_ms)
+            win_amps = full_signal[win_peaks]
+            br_bpm = _estimate_breathing_rate_from_ecg(win_peaks, win_amps, sfreq)
+
+            rows.append(
+                dict(
+                    time_s=centre_s,
+                    channel=ch_name,
+                    hr_bpm=hr_bpm,
+                    rmssd_ms=hrv["rmssd_ms"],
+                    sdnn_ms=hrv["sdnn_ms"],
+                    lf_ms2=hrv["lf_ms2"],
+                    hf_ms2=hrv["hf_ms2"],
+                    lf_hf_ratio=hrv["lf_hf_ratio"],
+                    breathing_rate_bpm=br_bpm,
+                )
+            )
+
+    return pd.DataFrame(rows)
+
+
 def save_ecg_checkpoint(
     features: pd.DataFrame, patient_out: Path, label: str
 ) -> None:
