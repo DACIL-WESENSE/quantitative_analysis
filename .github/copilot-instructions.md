@@ -53,7 +53,7 @@ output/             # generated CSVs, plots, HTML report; gitignored
 
 ## Key conventions
 
-- **Coding style**: PEP 8, NumPy-style docstrings, type hints on all public functions.
+- **Coding style**: PEP 8, NumPy-style docstrings, type hints on all public functions. No emojis should be used.
 - **Private helpers** are prefixed with `_` (e.g. `_parse_telemetry`, `_estimate_hr_from_signal`).
 - **Matplotlib backend** is set to `"Agg"` at import time in `functions.py` — plots are never shown interactively, only saved to disk via `_save_figure`.
 - **MNE log level** is globally set to `"WARNING"` in `functions.py`.
