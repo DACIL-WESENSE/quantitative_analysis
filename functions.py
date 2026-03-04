@@ -28,6 +28,8 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from matplotlib.figure import Figure
+from scipy import signal as sp_signal
+from scipy.interpolate import interp1d
 from sklearn.cluster import DBSCAN, KMeans
 from sklearn.decomposition import PCA
 from sklearn.impute import SimpleImputer
@@ -229,10 +231,14 @@ def _parse_telemetry(df: pd.DataFrame) -> pd.DataFrame:
     # Forward-fill so every data row inherits the most recent stage label.
     df["Stage"] = stage_series.ffill()
 
-    # Drop rows that are purely annotation rows (non-numeric first column).
-    first_col = df.columns[0]
-    df[first_col] = pd.to_numeric(df[first_col], errors="coerce")
-    df = df.dropna(subset=[first_col])
+    # Keep only rows that look like data rows:
+    #   - first column matches a HH:MM time string (excludes the units row)
+    #   - no stage keyword was detected in the row itself (excludes annotation rows)
+    annotation_mask = stage_series.notna()
+    time_mask = (
+        df.iloc[:, 0].astype(str).str.strip().str.match(r"^\d+:\d{2}", na=False)
+    )
+    df = df[time_mask & ~annotation_mask].copy()
 
     df.reset_index(drop=True, inplace=True)
     return df
@@ -260,17 +266,24 @@ def load_ecg(bdf_path: Path) -> Optional[mne.io.BaseRaw]:
         return None
 
 
-def extract_ecg_features(raw: mne.io.BaseRaw) -> pd.DataFrame:
+def extract_ecg_features(
+    raw: mne.io.BaseRaw,
+    chunk_duration: float = 120.0,
+) -> pd.DataFrame:
     """Compute basic ECG summary statistics from a Raw object.
 
-    The function picks ECG channels (or the first EEG channel as a fallback),
-    computes per-channel mean absolute amplitude and estimated heart rate from
-    R-peak detection.
+    The recording is processed in *chunk_duration*-second windows, with chunk
+    boundaries snapped to BDF data-record boundaries to avoid misaligned reads
+    on files with mixed per-channel sampling rates.  Per-channel statistics are
+    aggregated across all chunks.
 
     Parameters
     ----------
     raw : mne.io.BaseRaw
-        Loaded MNE Raw object.
+        Loaded MNE Raw object (``preload=False`` is fine).
+    chunk_duration : float
+        Requested window length in seconds (default 120 s).  The actual chunk
+        size is rounded up to the nearest BDF record boundary.
 
     Returns
     -------
@@ -278,29 +291,174 @@ def extract_ecg_features(raw: mne.io.BaseRaw) -> pd.DataFrame:
         One row per ECG channel with columns ``channel``, ``mean_abs_uV``,
         ``estimated_hr_bpm``.
     """
-    raw.load_data(verbose=False)
+    sfreq = raw.info["sfreq"]
+    total_samples = raw.n_times
 
-    # Pick ECG channels; fall back to first available channel.
+    # ── Determine record-boundary size from BDF metadata ─────────────────
+    record_samples = 1
+    if hasattr(raw, "_raw_extras") and raw._raw_extras:
+        extras = raw._raw_extras[0]
+        rec_len = float(extras.get("record_length", [1.0])[0])
+        record_samples = max(1, int(round(rec_len * sfreq)))
+
+    # Snap requested chunk to the nearest multiple of record_samples so that
+    # every start/stop boundary falls on a BDF record edge.
+    chunk_req = max(record_samples, int(chunk_duration * sfreq))
+    chunk_samples = int(round(chunk_req / record_samples)) * record_samples
+
+    # ── Channel selection ─────────────────────────────────────────────────
+    # Priority: MNE-typed ECG > channels named 'ecg*' > MNE-typed EEG > first 2
     ecg_picks = mne.pick_types(raw.info, ecg=True)
+    if len(ecg_picks) == 0:
+        # Name-based fallback: pick channels whose label contains 'ecg'
+        ecg_picks = np.array(
+            [i for i, ch in enumerate(raw.ch_names) if "ecg" in ch.lower()],
+            dtype=int,
+        )
     if len(ecg_picks) == 0:
         ecg_picks = mne.pick_types(raw.info, eeg=True, meg=False)
     if len(ecg_picks) == 0:
         ecg_picks = np.arange(min(2, len(raw.ch_names)))
 
+    # ── Per-chunk accumulation ─────────────────────────────────────────────
+    ch_stats: Dict[int, Dict[str, list]] = {
+        idx: {"mean_abs_uV": [], "estimated_hr_bpm": []} for idx in ecg_picks
+    }
+
+    start = 0
+    while start < total_samples:
+        # Snap stop to a record boundary; honour end-of-file on final chunk.
+        stop_aligned = start + chunk_samples
+        stop = min(stop_aligned, total_samples)
+        for ch_idx in ecg_picks:
+            data, _ = raw[ch_idx, start:stop]
+            data = data.squeeze()
+            ch_stats[ch_idx]["mean_abs_uV"].append(
+                float(np.mean(np.abs(data)) * 1e6)
+            )
+            ch_stats[ch_idx]["estimated_hr_bpm"].append(
+                _estimate_hr_from_signal(data, sfreq)
+            )
+        start = stop_aligned  # advance by full aligned chunk, not clipped stop
+
     records = []
     for ch_idx in ecg_picks:
-        ch_name = raw.ch_names[ch_idx]
-        data, _ = raw[ch_idx, :]
-        data = data.squeeze()
-        mean_abs = float(np.mean(np.abs(data)) * 1e6)  # convert V to uV
-
-        # Estimate HR via autocorrelation of the signal envelope.
-        hr_bpm = _estimate_hr_from_signal(data, raw.info["sfreq"])
+        hr_vals = [v for v in ch_stats[ch_idx]["estimated_hr_bpm"] if not np.isnan(v)]
         records.append(
-            {"channel": ch_name, "mean_abs_uV": mean_abs, "estimated_hr_bpm": hr_bpm}
+            {
+                "channel": raw.ch_names[ch_idx],
+                "mean_abs_uV": float(np.mean(ch_stats[ch_idx]["mean_abs_uV"])),
+                "estimated_hr_bpm": float(np.median(hr_vals)) if hr_vals else float("nan"),
+            }
         )
 
     return pd.DataFrame(records)
+
+
+def extract_ecg_timeseries(
+    raw: mne.io.BaseRaw,
+    window_duration: float = 30.0,
+) -> pd.DataFrame:
+    """Extract time-resolved ECG features using a sliding window.
+
+    For each ECG channel the full signal is R-peak detected, then divided into
+    non-overlapping windows.  Per-window statistics include heart rate,
+    time-domain HRV (RMSSD, SDNN) and frequency-domain HRV (LF, HF, LF/HF),
+    plus an ECG-derived respiration (EDR) breathing rate estimate.
+
+    Parameters
+    ----------
+    raw : mne.io.BaseRaw
+        Loaded MNE Raw object (``preload=False`` is fine).
+    window_duration : float
+        Duration of each analysis window in seconds (default 30 s).
+        Frequency-domain HRV values are exploratory at short windows; the
+        clinical standard is ≥ 300 s.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: ``time_s``, ``channel``, ``hr_bpm``, ``rmssd_ms``,
+        ``sdnn_ms``, ``lf_ms2``, ``hf_ms2``, ``lf_hf_ratio``,
+        ``breathing_rate_bpm``.
+        ``time_s`` is the centre of each window in seconds from recording
+        start.  Values are ``NaN`` when fewer than 10 R-peaks are detected
+        in a window.
+    """
+    sfreq = raw.info["sfreq"]
+    total_samples = raw.n_times
+    window_samples = max(1, int(window_duration * sfreq))
+
+    # Same channel-selection priority as extract_ecg_features.
+    ecg_picks = mne.pick_types(raw.info, ecg=True)
+    if len(ecg_picks) == 0:
+        ecg_picks = np.array(
+            [i for i, ch in enumerate(raw.ch_names) if "ecg" in ch.lower()],
+            dtype=int,
+        )
+    if len(ecg_picks) == 0:
+        ecg_picks = mne.pick_types(raw.info, eeg=True, meg=False)
+    if len(ecg_picks) == 0:
+        ecg_picks = np.arange(min(2, len(raw.ch_names)))
+
+    rows: List[Dict] = []
+    nan = float("nan")
+
+    for ch_idx in ecg_picks:
+        ch_name = raw.ch_names[ch_idx]
+        full_data, _ = raw[ch_idx, :]
+        full_signal = full_data.squeeze()
+
+        # Detect R-peaks on the entire channel signal once.
+        all_r_peaks = _detect_r_peaks(full_signal, sfreq)
+
+        for win_start in range(0, total_samples, window_samples):
+            win_stop = min(win_start + window_samples, total_samples)
+            centre_s = (win_start + win_stop) / 2.0 / sfreq
+
+            # R-peaks that fall within this window.
+            mask = (all_r_peaks >= win_start) & (all_r_peaks < win_stop)
+            win_peaks = all_r_peaks[mask]
+
+            if len(win_peaks) < 10:
+                rows.append(
+                    dict(
+                        time_s=centre_s, channel=ch_name,
+                        hr_bpm=nan, rmssd_ms=nan, sdnn_ms=nan,
+                        lf_ms2=nan, hf_ms2=nan, lf_hf_ratio=nan,
+                        breathing_rate_bpm=nan,
+                    )
+                )
+                continue
+
+            # RR intervals in milliseconds.
+            rr_ms = np.diff(win_peaks) / sfreq * 1000.0
+
+            # Instantaneous HR from median RR.
+            median_rr_s = float(np.median(rr_ms)) / 1000.0
+            hr_bpm = 60.0 / median_rr_s if median_rr_s > 0 else nan
+
+            hrv = _compute_hrv_metrics(rr_ms)
+
+            # EDR breathing rate from R-peak amplitudes.
+            win_amps = full_signal[win_peaks]
+            br_bpm = _estimate_breathing_rate_from_ecg(win_peaks, win_amps, sfreq)
+
+            rows.append(
+                dict(
+                    time_s=centre_s,
+                    channel=ch_name,
+                    hr_bpm=hr_bpm,
+                    rmssd_ms=hrv["rmssd_ms"],
+                    sdnn_ms=hrv["sdnn_ms"],
+                    lf_ms2=hrv["lf_ms2"],
+                    hf_ms2=hrv["hf_ms2"],
+                    lf_hf_ratio=hrv["lf_hf_ratio"],
+                    breathing_rate_bpm=br_bpm,
+                )
+            )
+
+    return pd.DataFrame(rows)
 
 
 def save_ecg_checkpoint(
@@ -401,6 +559,157 @@ def _estimate_hr_from_signal(signal: np.ndarray, sfreq: float) -> float:
         return float("nan")
 
 
+def _detect_r_peaks(signal_1d: np.ndarray, sfreq: float) -> np.ndarray:
+    """Detect R-peak positions in a 1-D ECG signal.
+
+    Parameters
+    ----------
+    signal_1d : np.ndarray
+        1-D ECG amplitude array (any unit).
+    sfreq : float
+        Sampling frequency in Hz.
+
+    Returns
+    -------
+    np.ndarray
+        Integer array of sample indices where R-peaks were detected.
+    """
+    try:
+        # Band-pass 5–40 Hz to isolate the QRS complex.
+        low, high = 5.0 / (0.5 * sfreq), 40.0 / (0.5 * sfreq)
+        low = max(1e-4, min(low, 0.999))
+        high = max(low + 1e-4, min(high, 0.999))
+        b, a = sp_signal.butter(2, [low, high], btype="band")
+        filtered = sp_signal.filtfilt(b, a, signal_1d)
+
+        # Rectify and detect peaks.
+        min_dist = int(0.3 * sfreq)  # 200 bpm upper limit
+        threshold = 0.3 * float(np.max(np.abs(filtered)))
+        peaks, _ = sp_signal.find_peaks(
+            np.abs(filtered), distance=min_dist, height=threshold
+        )
+        return peaks
+    except Exception:
+        return np.array([], dtype=int)
+
+
+def _compute_hrv_metrics(rr_ms: np.ndarray) -> Dict[str, float]:
+    """Compute time- and frequency-domain HRV metrics from RR intervals.
+
+    Parameters
+    ----------
+    rr_ms : np.ndarray
+        Array of successive RR intervals in milliseconds.
+
+    Returns
+    -------
+    Dict[str, float]
+        Keys: ``sdnn_ms``, ``rmssd_ms``, ``lf_ms2``, ``hf_ms2``,
+        ``lf_hf_ratio``.  Values are ``float('nan')`` when the input is
+        too short for reliable estimation.
+    """
+    nan = float("nan")
+    result: Dict[str, float] = dict(
+        sdnn_ms=nan, rmssd_ms=nan, lf_ms2=nan, hf_ms2=nan, lf_hf_ratio=nan
+    )
+
+    if len(rr_ms) < 3:
+        return result
+
+    # Time-domain metrics.
+    result["sdnn_ms"] = float(np.std(rr_ms, ddof=1))
+    successive_diff = np.diff(rr_ms)
+    result["rmssd_ms"] = float(np.sqrt(np.mean(successive_diff ** 2)))
+
+    # Frequency-domain: resample RR to 4 Hz for spectral analysis.
+    if len(rr_ms) < 5:
+        return result
+
+    try:
+        rr_s = rr_ms / 1000.0
+        cumulative_t = np.cumsum(rr_s)
+        cumulative_t -= cumulative_t[0]  # start at 0
+        target_fs = 4.0
+        t_uniform = np.arange(0, cumulative_t[-1], 1.0 / target_fs)
+        if len(t_uniform) < 8:
+            return result
+
+        interpolator = interp1d(cumulative_t, rr_ms, kind="linear", fill_value="extrapolate")
+        rr_uniform = interpolator(t_uniform)
+
+        freqs, psd = sp_signal.welch(rr_uniform, fs=target_fs, nperseg=min(len(rr_uniform), 64))
+
+        lf_mask = (freqs >= 0.04) & (freqs < 0.15)
+        hf_mask = (freqs >= 0.15) & (freqs < 0.40)
+        freq_res = freqs[1] - freqs[0] if len(freqs) > 1 else 1.0
+
+        lf = float(np.trapz(psd[lf_mask], freqs[lf_mask])) if lf_mask.any() else nan
+        hf = float(np.trapz(psd[hf_mask], freqs[hf_mask])) if hf_mask.any() else nan
+
+        result["lf_ms2"] = lf
+        result["hf_ms2"] = hf
+        if not np.isnan(lf) and not np.isnan(hf) and hf > 0:
+            result["lf_hf_ratio"] = lf / hf
+    except Exception:
+        pass
+
+    return result
+
+
+def _estimate_breathing_rate_from_ecg(
+    r_peak_indices: np.ndarray,
+    r_amplitudes: np.ndarray,
+    sfreq: float,
+) -> float:
+    """Estimate breathing rate from ECG-derived respiration (EDR).
+
+    Uses the amplitude modulation of R-peaks (a well-established proxy for
+    respiratory effort) to extract the dominant breathing frequency.
+
+    Parameters
+    ----------
+    r_peak_indices : np.ndarray
+        Sample indices of detected R-peaks.
+    r_amplitudes : np.ndarray
+        Signal amplitude at each R-peak (same length as *r_peak_indices*).
+    sfreq : float
+        Sampling frequency of the original ECG signal in Hz.
+
+    Returns
+    -------
+    float
+        Estimated breathing rate in breaths per minute, or ``float('nan')``
+        on failure.
+    """
+    if len(r_peak_indices) < 8:
+        return float("nan")
+
+    try:
+        # Times of each R-peak in seconds.
+        r_times = r_peak_indices / sfreq
+
+        # Resample amplitude envelope to 4 Hz.
+        target_fs = 4.0
+        t_uniform = np.arange(r_times[0], r_times[-1], 1.0 / target_fs)
+        if len(t_uniform) < 8:
+            return float("nan")
+
+        interp = interp1d(r_times, r_amplitudes, kind="linear", fill_value="extrapolate")
+        env_uniform = interp(t_uniform)
+
+        # Welch PSD; look for dominant peak in the breathing band (0.1–0.5 Hz = 6–30 bpm).
+        freqs, psd = sp_signal.welch(env_uniform, fs=target_fs, nperseg=min(len(env_uniform), 64))
+        breath_mask = (freqs >= 0.1) & (freqs <= 0.5)
+        if not breath_mask.any():
+            return float("nan")
+
+        dominant_idx = int(np.argmax(psd[breath_mask]))
+        dominant_freq = freqs[breath_mask][dominant_idx]
+        return float(dominant_freq * 60.0)
+    except Exception:
+        return float("nan")
+
+
 def sync_ecg_with_telemetry(
     ecg_features: pd.DataFrame,
     telemetry_df: pd.DataFrame,
@@ -437,6 +746,7 @@ def process_patient(
     folder: Path,
     output_base: Path,
     use_ecg_checkpoint: bool = True,
+    skip_ecg: bool = False,
 ) -> Optional[Dict]:
     """Run the full pipeline for a single patient folder.
 
@@ -454,7 +764,11 @@ def process_patient(
         automatically.
     use_ecg_checkpoint : bool
         When ``True``, load cached ECG features from disk if available,
-        skipping BDF reprocessing.
+        skipping BDF reprocessing.  Ignored when *skip_ecg* is ``True``.
+    skip_ecg : bool
+        When ``True``, skip all BDF discovery, ECG loading, feature
+        extraction, and ECG synchronisation entirely.  The ECG helpers in
+        this module remain available for standalone use.
 
     Returns
     -------
@@ -478,37 +792,36 @@ def process_patient(
                     patient_id, *telemetry_df.shape)
 
         # ── Load / extract ECG features ───────────────────────────────────
-        l1_path, l2_path = find_bdf_files(folder)
-        ecg_features_list = []
+        ecg_features = pd.DataFrame()
+        if not skip_ecg:
+            l1_path, l2_path = find_bdf_files(folder)
+            ecg_features_list = []
 
-        for bdf_label, bdf_path in [("L1", l1_path), ("L2", l2_path)]:
-            if bdf_path is None:
-                logger.warning("  %s — %s BDF not found.", patient_id, bdf_label)
-                continue
+            for bdf_label, bdf_path in [("L1", l1_path), ("L2", l2_path)]:
+                if bdf_path is None:
+                    logger.warning("  %s — %s BDF not found.", patient_id, bdf_label)
+                    continue
 
-            feats = None
-            if use_ecg_checkpoint:
-                feats = load_ecg_checkpoint(patient_out, bdf_label)
+                feats = None
+                if use_ecg_checkpoint:
+                    feats = load_ecg_checkpoint(patient_out, bdf_label)
 
-            if feats is None:
-                raw = load_ecg(bdf_path)
-                if raw is not None:
-                    feats = extract_ecg_features(raw)
-                    save_ecg_checkpoint(feats, patient_out, bdf_label)
+                if feats is None:
+                    raw = load_ecg(bdf_path)
+                    if raw is not None:
+                        feats = extract_ecg_features(raw)
+                        save_ecg_checkpoint(feats, patient_out, bdf_label)
 
-            if feats is not None:
-                feats = feats.copy()
-                feats["bdf_label"] = bdf_label
-                ecg_features_list.append(feats)
+                if feats is not None:
+                    feats = feats.copy()
+                    feats["bdf_label"] = bdf_label
+                    ecg_features_list.append(feats)
 
-        ecg_features = (
-            pd.concat(ecg_features_list, ignore_index=True)
-            if ecg_features_list
-            else pd.DataFrame()
-        )
+            if ecg_features_list:
+                ecg_features = pd.concat(ecg_features_list, ignore_index=True)
 
-        # ── Synchronise ECG + telemetry ───────────────────────────────────
-        telemetry_df = sync_ecg_with_telemetry(ecg_features, telemetry_df)
+            # ── Synchronise ECG + telemetry ───────────────────────────────
+            telemetry_df = sync_ecg_with_telemetry(ecg_features, telemetry_df)
 
         # ── Save cleaned CSV ──────────────────────────────────────────────
         save_telemetry_csv(telemetry_df, patient_id, patient_out)
@@ -637,12 +950,15 @@ def plot_batch_aggregates(
     1. Box plot of ``VO2`` (or first available VO2-like column) grouped by
        ``Gender``.
     2. Scatter plot of ``BMI`` vs peak VO2.
+    3. Scatter plot of peak VO2 vs patient ``Age``.
+    4. Scatter plot of peak VO2 vs peak ``Power`` (work rate).
 
     Parameters
     ----------
     summary_df : pd.DataFrame
         Master summary DataFrame with one row per patient and columns
-        including ``Gender``, ``BMI``, and any VO2-related metric.
+        including ``Gender``, ``BMI``, ``Age``, ``Power``, and any
+        VO2-related metric.
     output_dir : Optional[Path]
         If provided, figures are saved to this directory.
 
@@ -653,9 +969,11 @@ def plot_batch_aggregates(
     """
     figures: List[Figure] = []
 
-    vo2_col = _find_column(summary_df, ["VO2", "vo2", "VO2max", "vo2_max"])
+    vo2_col = _find_column(summary_df, ["VO2", "vo2", "VO2max", "vo2_max", "peak_vo2_ml_min"])
     gender_col = _find_column(summary_df, ["Gender", "gender", "Geslacht"])
     bmi_col = _find_column(summary_df, ["BMI", "bmi"])
+    age_col = _find_column(summary_df, ["Age", "age", "Leeftijd"])
+    power_col = _find_column(summary_df, ["Power", "power", "Watt", "watt"])
 
     if vo2_col and gender_col:
         fig, ax = plt.subplots(figsize=(7, 5))
@@ -678,7 +996,316 @@ def plot_batch_aggregates(
         _save_figure(fig, output_dir, "batch_bmi_vs_vo2.png")
         figures.append(fig)
 
+    if age_col and vo2_col:
+        sub = summary_df[[age_col, vo2_col]].apply(
+            pd.to_numeric, errors="coerce"
+        ).dropna()
+        if not sub.empty:
+            fig, ax = plt.subplots(figsize=(7, 5))
+            ax.scatter(sub[age_col], sub[vo2_col], alpha=0.7, edgecolors="k")
+            ax.set_xlabel(f"{age_col} (years)")
+            ax.set_ylabel(f"Peak {vo2_col}")
+            ax.set_title(f"Peak {vo2_col} vs {age_col}")
+            fig.tight_layout()
+            _save_figure(fig, output_dir, "batch_vo2_vs_age.png")
+            figures.append(fig)
+
+    if power_col and vo2_col:
+        sub = summary_df[[power_col, vo2_col]].apply(
+            pd.to_numeric, errors="coerce"
+        ).dropna()
+        if not sub.empty:
+            fig, ax = plt.subplots(figsize=(7, 5))
+            ax.scatter(sub[power_col], sub[vo2_col], alpha=0.7, edgecolors="k")
+            ax.set_xlabel(f"Peak {power_col} (W)")
+            ax.set_ylabel(f"Peak {vo2_col}")
+            ax.set_title(f"Peak {vo2_col} vs Peak {power_col}")
+            fig.tight_layout()
+            _save_figure(fig, output_dir, "batch_vo2_vs_power.png")
+            figures.append(fig)
+
     return figures
+
+
+def plot_ve_vco2_slope(
+    telemetry_df: pd.DataFrame,
+    patient_id: str,
+    output_dir: Optional[Path] = None,
+) -> Optional[Figure]:
+    """Plot VE vs VCO₂ during active exercise stages with an OLS regression line.
+
+    The slope of the VE/VCO₂ relationship (ventilatory efficiency) is a
+    prognostically important CPET marker.  A slope < 30 is normal; >= 34
+    indicates elevated ventilatory demand associated with heart failure or
+    pulmonary hypertension.
+
+    Parameters
+    ----------
+    telemetry_df : pd.DataFrame
+        Cleaned telemetry DataFrame with a ``Stage`` column.
+    patient_id : str
+        Label used in the figure title and saved filename.
+    output_dir : Optional[Path]
+        If provided, the figure is saved as a PNG in this directory.
+
+    Returns
+    -------
+    Optional[Figure]
+        Matplotlib figure, or ``None`` if required columns are absent.
+    """
+    ve_col = _find_column(telemetry_df, ["VE", "V'E", "V.E", "ve"])
+    vco2_col = _find_column(telemetry_df, ["VCO2", "V'CO2", "V.CO2", "vco2"])
+    if ve_col is None or vco2_col is None:
+        logger.warning(
+            "%s: VE or VCO2 column not found, skipping VE/VCO2 slope.", patient_id
+        )
+        return None
+
+    active_stages = {"Test", "VT1", "VT2"}
+    if "Stage" in telemetry_df.columns:
+        mask = telemetry_df["Stage"].isin(active_stages)
+        tdf = telemetry_df[mask] if mask.any() else telemetry_df
+    else:
+        tdf = telemetry_df
+
+    tdf = (
+        tdf[[ve_col, vco2_col]]
+        .apply(pd.to_numeric, errors="coerce")
+        .dropna()
+    )
+    if len(tdf) < 5:
+        logger.warning("%s: insufficient data for VE/VCO2 slope.", patient_id)
+        return None
+
+    x = tdf[vco2_col].values
+    y = tdf[ve_col].values
+    x_mean, y_mean = x.mean(), y.mean()
+    denom = float(np.sum((x - x_mean) ** 2))
+    slope = float(np.sum((x - x_mean) * (y - y_mean)) / denom) if denom > 0 else float("nan")
+    intercept = y_mean - slope * x_mean
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.scatter(x, y, s=15, alpha=0.6, label="Data (active stages)")
+    x_fit = np.array([x.min(), x.max()])
+    ax.plot(x_fit, slope * x_fit + intercept, color="red", linewidth=1.5,
+            label=f"OLS slope = {slope:.2f}")
+    ax.axline((0, 0), slope=30, color="grey", linestyle="--", linewidth=1,
+              label="Reference slope = 30")
+    ax.set_xlabel(f"{vco2_col} (mL/min)")
+    ax.set_ylabel(f"{ve_col} (L/min)")
+    ax.set_title(f"{patient_id} - VE/VCO\u2082 slope")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    _save_figure(fig, output_dir, f"{patient_id}_ve_vco2_slope.png")
+    return fig
+
+
+def plot_oxygen_pulse(
+    telemetry_df: pd.DataFrame,
+    patient_id: str,
+    output_dir: Optional[Path] = None,
+) -> Optional[Figure]:
+    """Plot the oxygen pulse (VO₂/HR) trajectory coloured by trial stage.
+
+    Oxygen pulse is a non-invasive proxy for stroke volume (SV × O₂
+    extraction).  A plateau during increasing work rate may indicate
+    inadequate cardiac output augmentation.
+
+    Parameters
+    ----------
+    telemetry_df : pd.DataFrame
+        Cleaned telemetry DataFrame with a ``Stage`` column.
+    patient_id : str
+        Label used in the figure title and saved filename.
+    output_dir : Optional[Path]
+        If provided, the figure is saved as a PNG in this directory.
+
+    Returns
+    -------
+    Optional[Figure]
+        Matplotlib figure, or ``None`` if required columns are absent.
+    """
+    o2p_col = _find_column(telemetry_df, ["VO2/HR", "VO2/hr", "o2_pulse", "O2pulse"])
+    vo2_col = _find_column(telemetry_df, ["VO2", "V'O2", "V.O2", "vo2"])
+    hr_col = _find_column(telemetry_df, ["HR", "hr", "Heart Rate"])
+
+    if o2p_col is not None:
+        series = pd.to_numeric(telemetry_df[o2p_col], errors="coerce")
+        label = o2p_col
+    elif vo2_col is not None and hr_col is not None:
+        vo2 = pd.to_numeric(telemetry_df[vo2_col], errors="coerce")
+        hr = pd.to_numeric(telemetry_df[hr_col], errors="coerce")
+        series = vo2 / hr.replace(0, float("nan"))
+        label = "VO2/HR (computed)"
+    else:
+        logger.warning(
+            "%s: VO2/HR or (VO2, HR) columns not found, skipping oxygen pulse.", patient_id
+        )
+        return None
+
+    if series.dropna().empty:
+        return None
+
+    stage_col = _find_column(telemetry_df, ["Stage"])
+    fig, ax = plt.subplots(figsize=(9, 4))
+    stage_palette = dict(zip(STAGE_ORDER, sns.color_palette("tab10", len(STAGE_ORDER))))
+
+    if stage_col and stage_col in telemetry_df.columns:
+        for stage, grp in telemetry_df.groupby(stage_col, observed=True):
+            idx = grp.index
+            color = stage_palette.get(str(stage), "grey")
+            ax.plot(idx, series.loc[idx], color=color, label=str(stage), linewidth=1.2)
+    else:
+        ax.plot(series.values, linewidth=1.2)
+
+    ax.set_xlabel("Observation index")
+    ax.set_ylabel(f"{label} (mL/beat)")
+    ax.set_title(f"{patient_id} - Oxygen pulse trajectory")
+    ax.legend(fontsize=8, loc="upper left")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    _save_figure(fig, output_dir, f"{patient_id}_oxygen_pulse.png")
+    return fig
+
+
+def plot_ventilatory_efficiency(
+    telemetry_df: pd.DataFrame,
+    patient_id: str,
+    output_dir: Optional[Path] = None,
+) -> Optional[Figure]:
+    """Plot VE/VO₂ and VE/VCO₂ ventilatory equivalent curves over time.
+
+    Both curves are smoothed with a 5-point rolling mean.  The nadir of
+    each curve is annotated.  The nadir of VE/VCO₂ is the clinically
+    preferred ventilatory efficiency index (normal < 30).  VE/VO₂ and
+    VE/VCO₂ cross near the first ventilatory threshold (VT1).
+
+    Parameters
+    ----------
+    telemetry_df : pd.DataFrame
+        Cleaned telemetry DataFrame.
+    patient_id : str
+        Label used in the figure title and saved filename.
+    output_dir : Optional[Path]
+        If provided, the figure is saved as a PNG in this directory.
+
+    Returns
+    -------
+    Optional[Figure]
+        Matplotlib figure, or ``None`` if required columns are absent.
+    """
+    ve_col = _find_column(telemetry_df, ["VE", "V'E", "V.E", "ve"])
+    vo2_col = _find_column(telemetry_df, ["VO2", "V'O2", "V.O2", "vo2"])
+    vco2_col = _find_column(telemetry_df, ["VCO2", "V'CO2", "V.CO2", "vco2"])
+
+    if ve_col is None or (vo2_col is None and vco2_col is None):
+        logger.warning(
+            "%s: VE and at least one of VO2/VCO2 required for ventilatory efficiency.",
+            patient_id,
+        )
+        return None
+
+    ve = pd.to_numeric(telemetry_df[ve_col], errors="coerce")
+    curves: Dict[str, pd.Series] = {}
+    if vo2_col is not None:
+        vo2 = pd.to_numeric(telemetry_df[vo2_col], errors="coerce")
+        ratio = ve / vo2.replace(0, float("nan"))
+        curves["VE/VO\u2082"] = ratio.rolling(5, min_periods=1, center=True).mean()
+    if vco2_col is not None:
+        vco2 = pd.to_numeric(telemetry_df[vco2_col], errors="coerce")
+        ratio = ve / vco2.replace(0, float("nan"))
+        curves["VE/VCO\u2082"] = ratio.rolling(5, min_periods=1, center=True).mean()
+
+    if not curves:
+        return None
+
+    fig, ax = plt.subplots(figsize=(9, 4))
+    colors = ["steelblue", "darkorange"]
+    for (curve_name, curve), color in zip(curves.items(), colors):
+        clean = curve.dropna()
+        if clean.empty:
+            continue
+        positions = [clean.index.get_loc(i) for i in clean.index]
+        ax.plot(positions, clean.values, label=curve_name, color=color, linewidth=1.5)
+        nadir_idx = clean.idxmin()
+        nadir_pos = clean.index.get_loc(nadir_idx)
+        nadir_val = clean[nadir_idx]
+        ax.annotate(
+            f"nadir {nadir_val:.1f}",
+            xy=(nadir_pos, nadir_val),
+            xytext=(nadir_pos + max(1, int(len(clean) * 0.05)), nadir_val * 1.05),
+            arrowprops=dict(arrowstyle="->", color=color),
+            fontsize=8,
+            color=color,
+        )
+
+    ax.set_xlabel("Observation index")
+    ax.set_ylabel("Ventilatory equivalent")
+    ax.set_title(f"{patient_id} - Ventilatory efficiency (VE/VO\u2082 and VE/VCO\u2082)")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    _save_figure(fig, output_dir, f"{patient_id}_ventilatory_efficiency.png")
+    return fig
+
+
+def compute_breathing_reserve(
+    telemetry_df: pd.DataFrame,
+) -> Dict[str, float]:
+    """Compute breathing reserve from peak ventilation during active exercise stages.
+
+    MVV is estimated as ``peak_VE / 0.70``, which assumes a 30 % breathing
+    reserve at maximum exercise (the clinically accepted approximation when
+    spirometry MVV is unavailable).  A breathing reserve < 15 % (or < 11 L/min)
+    suggests a ventilatory limitation to exercise.
+
+    Parameters
+    ----------
+    telemetry_df : pd.DataFrame
+        Cleaned telemetry DataFrame with a ``Stage`` column.
+
+    Returns
+    -------
+    Dict[str, float]
+        Dictionary with keys:
+
+        * ``peak_VE``  — peak minute ventilation in L/min (NaN if absent)
+        * ``MVV_est``  — estimated maximal voluntary ventilation in L/min
+        * ``BR_L``     — breathing reserve in L/min (MVV_est - peak_VE)
+        * ``BR_pct``   — breathing reserve as percentage of MVV_est
+    """
+    ve_col = _find_column(telemetry_df, ["VE", "V'E", "V.E", "ve"])
+    nan_result: Dict[str, float] = {
+        "peak_VE": float("nan"),
+        "MVV_est": float("nan"),
+        "BR_L": float("nan"),
+        "BR_pct": float("nan"),
+    }
+    if ve_col is None:
+        return nan_result
+
+    active_stages = {"Test", "VT1", "VT2"}
+    if "Stage" in telemetry_df.columns:
+        mask = telemetry_df["Stage"].isin(active_stages)
+        active_df = telemetry_df[mask] if mask.any() else telemetry_df
+    else:
+        active_df = telemetry_df
+
+    ve = pd.to_numeric(active_df[ve_col], errors="coerce").dropna()
+    if ve.empty:
+        return nan_result
+
+    peak_ve = float(ve.max())
+    mvv_est = peak_ve / 0.70
+    br_l = mvv_est - peak_ve
+    br_pct = (br_l / mvv_est) * 100.0 if mvv_est > 0 else float("nan")
+
+    return {
+        "peak_VE": round(peak_ve, 2),
+        "MVV_est": round(mvv_est, 2),
+        "BR_L": round(br_l, 2),
+        "BR_pct": round(br_pct, 1),
+    }
 
 
 # ---------------------------------------------------------------------------
