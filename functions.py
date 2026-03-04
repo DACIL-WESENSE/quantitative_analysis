@@ -66,7 +66,7 @@ def discover_patient_folders(root_dir: str) -> List[Path]:
         Sorted list of patient folder paths.
     """
     root = Path(root_dir)
-    folders = sorted([p for p in root.iterdir() if p.is_dir()])
+    folders = sorted([p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")])
     logger.info("Discovered %d patient folder(s) under '%s'.", len(folders), root_dir)
     return folders
 
