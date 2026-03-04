@@ -124,10 +124,11 @@ def find_csv_file(folder: Path) -> Optional[Path]:
 
 
 def load_telemetry(csv_path: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Load patient metadata and telemetry data from a CSV file.
+    """Load patient metadata and telemetry data from a WESENSE CPET CSV file.
 
-    The function reads the CSV and uses the first row as headers.
-    Both ``info_df`` and ``telemetry_df`` are derived from the same file.
+    WESENSE exports begin with a 5-row metadata header (patient info), followed
+    by the column-name row, a units row, and then the time-series data.  This
+    function reads both sections separately.
 
     Parameters
     ----------
@@ -137,15 +138,27 @@ def load_telemetry(csv_path: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
     Returns
     -------
     Tuple[pd.DataFrame, pd.DataFrame]
-        ``(patient_info_df, telemetry_df)`` where *telemetry_df* has columns
-        for every metric and a ``Stage`` column parsed from annotation rows.
+        ``(info_df, telemetry_df)`` where *info_df* contains the raw metadata
+        rows (columns are integer-indexed, no header) and *telemetry_df* has
+        named metric columns plus a ``Stage`` column.
     """
-    raw = pd.read_csv(csv_path, header=0)
+    # ── Metadata (rows 0-3) ───────────────────────────────────────────────
+    info_df = pd.read_csv(
+        csv_path, header=None, nrows=4, encoding_errors="replace"
+    )
+
+    # ── Telemetry ─────────────────────────────────────────────────────────
+    # Skip rows 0-4 (metadata + blank); row 5 becomes the header.
+    # The units row (original row 6) ends up as the first data row; it
+    # contains strings in numeric columns and is dropped by _parse_telemetry.
+    raw = pd.read_csv(
+        csv_path,
+        skiprows=list(range(5)),
+        header=0,
+        encoding_errors="replace",
+    )
 
     logger.debug("CSV rows loaded: %d", len(raw))
-
-    info_df = raw
-
     telemetry_df = _parse_telemetry(raw)
 
     return info_df, telemetry_df
@@ -926,6 +939,381 @@ def build_patient_summary(
         row["ecg_estimated_hr_bpm"] = ecg_features["estimated_hr_bpm"].mean()
 
     return row
+
+
+# ---------------------------------------------------------------------------
+# COPD risk scoring
+# ---------------------------------------------------------------------------
+
+#: Clinical thresholds derived from ATS/ERS CPET guidelines and COPD literature.
+#: Sources: ATS/ACCP Statement on CPET (Am J Respir Crit Care Med 2003);
+#:          Puente-Maestu et al. ERJ 2016; Wasserman et al. "Principles of
+#:          Exercise Testing and Interpretation" 5th ed.
+_COPD_THRESHOLDS: Dict[str, float] = {
+    "peak_vo2_per_kg_low": 20.0,   # mL/min/kg  — below = elevated risk
+    "ve_vco2_slope_high": 34.0,    # above = elevated ventilatory inefficiency
+    "spo2_nadir_low": 95.0,        # % — below = exercise-induced desaturation
+    "spo2_drop_high": 4.0,         # % — drop ≥ 4 pp = clinically significant
+    "bf_peak_high": 40.0,          # breaths/min — above = severe hyperventilation
+    "rer_peak_low": 1.0,           # below at exhaustion = effort-limited test
+    "o2_pulse_peak_low": 10.0,     # mL/beat — below = reduced cardiac output
+}
+
+
+def parse_patient_meta(raw_df: pd.DataFrame) -> Dict:
+    """Extract patient metadata from the 5-row CSV header block.
+
+    The first five rows of a WESENSE CPET export contain key–value pairs
+    encoded across alternating columns, for example::
+
+        Identificatie: | WESENSETEST04 | Naam: | ... | Voornaam: | ...
+        Bezoekdatum:   | 09.01.2026    | Geboortedatum: | 1-1-1997 | Leeftijd: | 29 Jaar
+        Geslacht:      | vrouw         | Gewicht: | 68.0 kg | BMI: | 24 kg/m²
+        Gebruiker:     | ...
+
+    Parameters
+    ----------
+    raw_df : pd.DataFrame
+        DataFrame as returned by ``pd.read_csv(path, header=0)`` — i.e. the
+        first data row becomes the header and subsequent rows are data.
+
+    Returns
+    -------
+    Dict
+        Keys: ``patient_id``, ``visit_date``, ``birth_date``, ``age_years``,
+        ``sex``, ``weight_kg``, ``bmi``.  Missing values are ``None``.
+    """
+    meta: Dict = {
+        "patient_id": None,
+        "visit_date": None,
+        "birth_date": None,
+        "age_years": None,
+        "sex": None,
+        "weight_kg": None,
+        "bmi": None,
+    }
+
+    # The header itself (row 0 of the file) becomes column names; rows 0-2 of
+    # raw_df correspond to file rows 1-3 (0-indexed).
+    def _cell(row_idx: int, col_idx: int) -> str:
+        try:
+            return str(raw_df.iloc[row_idx, col_idx]).strip()
+        except (IndexError, KeyError):
+            return ""
+
+    # Row 0 (file row 1): Identificatie / Naam / Voornaam
+    meta["patient_id"] = _cell(0, 1) or None
+
+    # Row 1 (file row 2): Bezoekdatum / Geboortedatum / Leeftijd
+    meta["visit_date"] = _cell(1, 1) or None
+    meta["birth_date"] = _cell(1, 3) or None
+    age_raw = _cell(1, 5)
+    try:
+        meta["age_years"] = float(age_raw.split()[0])
+    except (ValueError, IndexError):
+        pass
+
+    # Row 2 (file row 3): Geslacht / Gewicht / BMI
+    meta["sex"] = _cell(2, 1) or None
+    weight_raw = _cell(2, 3)
+    try:
+        meta["weight_kg"] = float(weight_raw.split()[0])
+    except (ValueError, IndexError):
+        pass
+    bmi_raw = _cell(2, 5)
+    try:
+        meta["bmi"] = float(bmi_raw.split()[0])
+    except (ValueError, IndexError):
+        pass
+
+    return meta
+
+
+def extract_copd_features(
+    telemetry_df: pd.DataFrame,
+    weight_kg: Optional[float] = None,
+) -> pd.Series:
+    """Compute CPET-based markers associated with COPD severity.
+
+    All markers are derived from the cleaned telemetry DataFrame that
+    ``load_telemetry`` returns.  The ``Stage`` column is used to restrict
+    certain calculations to the relevant exercise phase.
+
+    Parameters
+    ----------
+    telemetry_df : pd.DataFrame
+        Cleaned telemetry DataFrame with a ``Stage`` column.
+    weight_kg : Optional[float]
+        Patient body weight in kg.  Required to compute peak VO₂/kg; if
+        ``None`` the marker is ``NaN``.
+
+    Returns
+    -------
+    pd.Series
+        Named Series with the following keys:
+
+        * ``peak_vo2_ml_min``      — peak oxygen uptake (mL/min)
+        * ``peak_vo2_per_kg``      — peak VO₂ normalised by body weight
+        * ``ve_vco2_slope``        — slope of V′E vs V′CO₂ (linear regression)
+        * ``spo2_nadir``           — minimum SpO₂ during the test (%)
+        * ``spo2_drop``            — baseline SpO₂ − nadir (percentage points)
+        * ``bf_peak``              — peak breathing frequency (breaths/min)
+        * ``rer_peak``             — peak respiratory exchange ratio
+        * ``o2_pulse_peak``        — peak oxygen pulse (mL/beat)
+        * ``vt1_present``          — 1.0 if VT1 stage present, else 0.0
+    """
+    df = telemetry_df.copy()
+
+    def _col(candidates: List[str]) -> Optional[str]:
+        return _find_column(df, candidates)
+
+    vo2_col = _col(["V'O2", "VO2", "V.O2", "vo2"])
+    vco2_col = _col(["V'CO2", "VCO2", "V.CO2", "vco2"])
+    ve_col = _col(["V'E", "VE", "V.E", "ve"])
+    spo2_col = _col(["SpO2", "SPO2", "spo2"])
+    bf_col = _col(["BF", "bf", "RR"])
+    rer_col = _col(["RER", "rer"])
+    o2_pulse_col = _col(["VO2/HR", "VO2/hr", "o2_pulse", "O2pulse"])
+
+    # Exercise phases to use for "peak" values (exclude warm-up and recovery)
+    active_stages = {"Test", "VT1", "VT2"}
+    if "Stage" in df.columns:
+        active_mask = df["Stage"].isin(active_stages)
+        active_df = df[active_mask] if active_mask.any() else df
+    else:
+        active_df = df
+
+    # ── Peak VO₂ ──────────────────────────────────────────────────────────
+    peak_vo2 = float(
+        pd.to_numeric(active_df[vo2_col], errors="coerce").max()
+    ) if vo2_col else float("nan")
+    if not np.isnan(peak_vo2) and weight_kg and weight_kg > 0:
+        peak_vo2_per_kg = peak_vo2 / weight_kg
+    else:
+        peak_vo2_per_kg = float("nan")
+
+    # ── VE/VCO₂ slope (linear regression over active stages) ──────────────
+    ve_vco2_slope = float("nan")
+    if ve_col and vco2_col:
+        subset = active_df[[ve_col, vco2_col]].copy()
+        subset[ve_col] = pd.to_numeric(subset[ve_col], errors="coerce")
+        subset[vco2_col] = pd.to_numeric(subset[vco2_col], errors="coerce")
+        subset = subset.dropna()
+        if len(subset) >= 5:
+            x = subset[vco2_col].values.astype(float)
+            y = subset[ve_col].values.astype(float)
+            # Least-squares slope via normal equations (avoid sklearn dependency)
+            x_mean, y_mean = x.mean(), y.mean()
+            denom = float(np.sum((x - x_mean) ** 2))
+            if denom > 0:
+                ve_vco2_slope = float(np.sum((x - x_mean) * (y - y_mean)) / denom)
+
+    # ── SpO₂ nadir and drop ───────────────────────────────────────────────
+    spo2_nadir = float("nan")
+    spo2_drop = float("nan")
+    if spo2_col:
+        spo2_series = pd.to_numeric(df[spo2_col], errors="coerce").dropna()
+        if not spo2_series.empty:
+            # Baseline: median of first 10 rows (resting / warm-up)
+            baseline_spo2 = float(spo2_series.head(10).median())
+            spo2_nadir = float(
+                pd.to_numeric(active_df[spo2_col], errors="coerce").min()
+            )
+            spo2_drop = max(0.0, baseline_spo2 - spo2_nadir)
+
+    # ── Peak breathing frequency ───────────────────────────────────────────
+    bf_peak = (
+        float(pd.to_numeric(active_df[bf_col], errors="coerce").max())
+        if bf_col else float("nan")
+    )
+
+    # ── Peak RER ──────────────────────────────────────────────────────────
+    rer_peak = (
+        float(pd.to_numeric(active_df[rer_col], errors="coerce").max())
+        if rer_col else float("nan")
+    )
+
+    # ── Peak oxygen pulse ─────────────────────────────────────────────────
+    o2_pulse_peak = (
+        float(pd.to_numeric(active_df[o2_pulse_col], errors="coerce").max())
+        if o2_pulse_col else float("nan")
+    )
+
+    # ── VT1 presence ──────────────────────────────────────────────────────
+    vt1_present = (
+        1.0
+        if "Stage" in df.columns and (df["Stage"] == "VT1").any()
+        else 0.0
+    )
+
+    return pd.Series(
+        {
+            "peak_vo2_ml_min": peak_vo2,
+            "peak_vo2_per_kg": peak_vo2_per_kg,
+            "ve_vco2_slope": ve_vco2_slope,
+            "spo2_nadir": spo2_nadir,
+            "spo2_drop": spo2_drop,
+            "bf_peak": bf_peak,
+            "rer_peak": rer_peak,
+            "o2_pulse_peak": o2_pulse_peak,
+            "vt1_present": vt1_present,
+        }
+    )
+
+
+def score_copd_risk(features: pd.Series) -> pd.Series:
+    """Apply clinical thresholds to CPET features and compute a composite risk score.
+
+    Each marker is compared against the thresholds in :data:`_COPD_THRESHOLDS`.
+    A flag of ``1`` indicates an abnormal value associated with elevated risk.
+    The composite score is the sum of all flags, mapped to an ordinal label.
+
+    Parameters
+    ----------
+    features : pd.Series
+        As returned by :func:`extract_copd_features`.
+
+    Returns
+    -------
+    pd.Series
+        Original feature values plus flag columns (``flag_*``) and:
+
+        * ``n_flags``       — total number of raised flags (int)
+        * ``risk_score``    — ``"Low"``, ``"Moderate"``, or ``"High"``
+    """
+    result = features.copy()
+    t = _COPD_THRESHOLDS
+
+    result["flag_low_peak_vo2"] = int(
+        not np.isnan(features["peak_vo2_per_kg"])
+        and features["peak_vo2_per_kg"] < t["peak_vo2_per_kg_low"]
+    )
+    result["flag_high_ve_vco2"] = int(
+        not np.isnan(features["ve_vco2_slope"])
+        and features["ve_vco2_slope"] > t["ve_vco2_slope_high"]
+    )
+    result["flag_low_spo2"] = int(
+        not np.isnan(features["spo2_nadir"])
+        and features["spo2_nadir"] < t["spo2_nadir_low"]
+    )
+    result["flag_spo2_drop"] = int(
+        not np.isnan(features["spo2_drop"])
+        and features["spo2_drop"] >= t["spo2_drop_high"]
+    )
+    result["flag_high_bf"] = int(
+        not np.isnan(features["bf_peak"])
+        and features["bf_peak"] > t["bf_peak_high"]
+    )
+    result["flag_low_rer"] = int(
+        not np.isnan(features["rer_peak"])
+        and features["rer_peak"] < t["rer_peak_low"]
+    )
+    result["flag_low_o2_pulse"] = int(
+        not np.isnan(features["o2_pulse_peak"])
+        and features["o2_pulse_peak"] < t["o2_pulse_peak_low"]
+    )
+
+    flag_cols = [c for c in result.index if c.startswith("flag_")]
+    n_flags = int(sum(result[c] for c in flag_cols))
+    result["n_flags"] = n_flags
+
+    if n_flags == 0:
+        risk = "Low"
+    elif n_flags <= 2:
+        risk = "Moderate"
+    else:
+        risk = "High"
+    result["risk_score"] = risk
+
+    return result
+
+
+def plot_copd_radar(
+    features: pd.Series,
+    patient_id: str = "",
+    output_dir: Optional[Path] = None,
+) -> Figure:
+    """Spider / radar chart of normalised COPD marker values.
+
+    Each marker is scaled to [0, 1] relative to its clinical threshold so
+    that values beyond the threshold appear in the outer (red) zone.
+
+    Parameters
+    ----------
+    features : pd.Series
+        As returned by :func:`extract_copd_features` (raw values, not flags).
+    patient_id : str
+        Used in the figure title and output filename.
+    output_dir : Optional[Path]
+        If provided, the figure is saved here.
+
+    Returns
+    -------
+    Figure
+        Matplotlib figure.
+    """
+    t = _COPD_THRESHOLDS
+
+    # Each tuple: (label, value, threshold, higher_is_worse)
+    markers = [
+        ("Peak VO₂/kg\n(mL/min/kg)", features.get("peak_vo2_per_kg", float("nan")),
+         t["peak_vo2_per_kg_low"], False),
+        ("VE/VCO₂\nslope", features.get("ve_vco2_slope", float("nan")),
+         t["ve_vco2_slope_high"], True),
+        ("SpO₂ nadir\n(%)", features.get("spo2_nadir", float("nan")),
+         t["spo2_nadir_low"], False),
+        ("SpO₂ drop\n(pp)", features.get("spo2_drop", float("nan")),
+         t["spo2_drop_high"], True),
+        ("Peak BF\n(br/min)", features.get("bf_peak", float("nan")),
+         t["bf_peak_high"], True),
+        ("Peak RER", features.get("rer_peak", float("nan")),
+         t["rer_peak_low"], False),
+        ("O₂ pulse\n(mL/beat)", features.get("o2_pulse_peak", float("nan")),
+         t["o2_pulse_peak_low"], False),
+    ]
+
+    labels = [m[0] for m in markers]
+    n = len(labels)
+    angles = np.linspace(0, 2 * np.pi, n, endpoint=False).tolist()
+    angles += angles[:1]  # close the polygon
+
+    # Normalise: threshold maps to 0.5; clip to [0, 1]
+    norm_values: List[float] = []
+    for _, val, thresh, higher_worse in markers:
+        if np.isnan(val) or thresh == 0:
+            norm_values.append(0.5)
+            continue
+        if higher_worse:
+            # value/threshold * 0.5  →  1.0 means 2× threshold
+            norm = np.clip(val / thresh * 0.5, 0.0, 1.0)
+        else:
+            # thresh/value * 0.5  →  1.0 means value = 0.5 × threshold
+            norm = np.clip(thresh / val * 0.5, 0.0, 1.0) if val > 0 else 1.0
+        norm_values.append(float(norm))
+    norm_values += norm_values[:1]
+
+    fig, ax = plt.subplots(figsize=(6, 6), subplot_kw={"polar": True})
+    ax.set_theta_offset(np.pi / 2)
+    ax.set_theta_direction(-1)
+    ax.set_thetagrids(np.degrees(angles[:-1]), labels, fontsize=8)
+    ax.set_ylim(0, 1)
+    ax.set_yticks([0.25, 0.5, 0.75, 1.0])
+    ax.set_yticklabels(["", "threshold", "", ""], fontsize=7)
+
+    # Reference circle at threshold (0.5)
+    ax.plot([a for a in angles], [0.5] * len(angles), color="grey",
+            linestyle="--", linewidth=0.8, alpha=0.6)
+
+    ax.plot(angles, norm_values, color="steelblue", linewidth=2)
+    ax.fill(angles, norm_values, color="steelblue", alpha=0.25)
+
+    title = f"COPD Marker Profile — {patient_id}" if patient_id else "COPD Marker Profile"
+    ax.set_title(title, pad=20, fontsize=10)
+    fig.tight_layout()
+
+    fname = f"{patient_id}_copd_radar.png" if patient_id else "copd_radar.png"
+    _save_figure(fig, output_dir, fname)
+    return fig
 
 
 # ---------------------------------------------------------------------------
