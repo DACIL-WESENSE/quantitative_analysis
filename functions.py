@@ -16,6 +16,7 @@ All functions follow PEP 8, include NumPy-style docstrings, and use type hints.
 
 import logging
 import os
+import pickle
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -273,6 +274,53 @@ def extract_ecg_features(raw: mne.io.BaseRaw) -> pd.DataFrame:
         )
 
     return pd.DataFrame(records)
+
+
+def save_ecg_checkpoint(
+    features: pd.DataFrame, patient_out: Path, label: str
+) -> None:
+    """Persist ECG feature DataFrame to a pickle checkpoint file.
+
+    Parameters
+    ----------
+    features : pd.DataFrame
+        Output from :func:`extract_ecg_features`.
+    patient_out : Path
+        Per-patient output directory (created if it does not exist).
+    label : str
+        BDF label, e.g. ``"L1"`` or ``"L2"``.
+    """
+    patient_out.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = patient_out / f"ecg_checkpoint_{label}.pkl"
+    with open(checkpoint_path, "wb") as fh:
+        pickle.dump(features, fh)
+    logger.info("ECG checkpoint saved: %s", checkpoint_path)
+
+
+def load_ecg_checkpoint(
+    patient_out: Path, label: str
+) -> Optional[pd.DataFrame]:
+    """Load a pickled ECG feature DataFrame from a checkpoint file.
+
+    Parameters
+    ----------
+    patient_out : Path
+        Per-patient output directory.
+    label : str
+        BDF label, e.g. ``"L1"`` or ``"L2"``.
+
+    Returns
+    -------
+    Optional[pd.DataFrame]
+        The cached feature DataFrame, or ``None`` if no checkpoint exists.
+    """
+    checkpoint_path = patient_out / f"ecg_checkpoint_{label}.pkl"
+    if not checkpoint_path.exists():
+        return None
+    with open(checkpoint_path, "rb") as fh:
+        features = pickle.load(fh)
+    logger.info("ECG checkpoint loaded: %s", checkpoint_path)
+    return features
 
 
 def _estimate_hr_from_signal(signal: np.ndarray, sfreq: float) -> float:
