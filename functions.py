@@ -31,6 +31,7 @@ from sklearn.cluster import DBSCAN, KMeans
 from sklearn.decomposition import PCA
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
+from tqdm.auto import tqdm
 
 # Use non-interactive backend so plots can be saved in batch mode.
 matplotlib.use("Agg")
@@ -187,7 +188,7 @@ def _parse_telemetry(df: pd.DataFrame) -> pd.DataFrame:
     stage_col: List[Optional[str]] = []
     current_stage: Optional[str] = None
 
-    for _, row in df.iterrows():
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Parsing telemetry", leave=False):
         row_text = " ".join(str(v) for v in row.values)
         matched = None
         for stage in STAGE_ORDER:
@@ -842,7 +843,7 @@ def elbow_plot(
         Matplotlib figure.
     """
     inertias = []
-    for k in k_range:
+    for k in tqdm(k_range, desc="Elbow (K-Means)"):
         km = KMeans(n_clusters=k, random_state=42, n_init=10)
         km.fit(X_scaled)
         inertias.append(km.inertia_)
