@@ -1,0 +1,157 @@
+import mne
+
+ 
+
+bdf_folder = YOUR PATH
+
+ 
+
+bdf_data = {}
+
+filtered_ppg_data = {}
+
+channel_names = {}
+
+text_data = {}
+
+fs_map = {}
+
+ 
+
+ecg_bdf_data = {}
+
+ecg_filtered_data = {}
+
+ecg_channel_names = {}
+
+ecg_fs_map = {}
+
+ 
+
+collected = []
+
+ 
+
+for root, dirs, files in os.walk(bdf_folder):
+
+    for f in files:
+
+        if f.lower().endswith(('.bdf', '.txt')):
+
+            full_path = os.path.join(root, f)
+
+            rel_path = os.path.relpath(full_path, bdf_folder).replace('\\', '/')
+
+            collected.append((rel_path, full_path))
+
+for rel_path, file_path in collected:
+
+    print(f"\nLoading {rel_path}...")
+
+    if rel_path.lower().endswith('.bdf'):
+
+        try:
+
+            raw = mne.io.read_raw_bdf(file_path, preload=True, verbose=False)
+
+        except Exception as e:
+
+            print(f"Failed to read BDF: {e}")
+
+            continue
+
+ 
+
+        data = raw.get_data()
+
+        fs = int(raw.info['sfreq'])
+
+ 
+
+        if 'ecg' in rel_path.lower():
+
+            ecg_bdf_data[rel_path] = data
+
+            ecg_channel_names[rel_path] = raw.ch_names
+
+            ecg_fs_map[rel_path] = fs
+
+            try:
+
+                if data.ndim == 1:
+
+                    ecg_filtered = filter_ecg(data, fs)
+
+                else:
+
+                    ecg_filtered = np.array([filter_ecg(ch, fs) for ch in data])
+
+                ecg_filtered_data[rel_path] = ecg_filtered
+
+                print(f" ECG BDF loaded | fs={fs} | ch={len(raw.ch_names)} (filtered)")
+
+            except Exception as e:
+
+                ecg_filtered_data[rel_path] = None
+
+                print(f" ECG BDF loaded | fs={fs} | ch={len(raw.ch_names)} (filter failed: {e})")
+
+ 
+
+        else:
+
+            bdf_data[rel_path] = data
+
+            channel_names[rel_path] = raw.ch_names
+
+            fs_map[rel_path] = fs
+
+ 
+
+            try:
+
+                filtered_ppg_data[rel_path] = filter_ppg(data, fs)
+
+                print(f" PPG BDF loaded | fs={fs} | ch={len(raw.ch_names)}")
+
+            except Exception as e:
+
+                print(f" filter_ppg failed: {e}")
+
+    else:
+
+        try:
+
+            df = read_txt_file(file_path, rel_path)
+
+            text_data[rel_path] = df
+
+ 
+
+            print(f"TXT loaded | shape={df.shape}")
+
+            print(f"     columns: {list(df.columns)}")
+
+ 
+
+        except Exception as e:
+
+            print(f"Failed to read TXT: {e}")
+
+ 
+
+print(f"\nFinished loading {len(collected)} files")
+
+print(f"  BDF (PPG): {len(bdf_data)}")
+
+print(f"  BDF (ECG): {len(ecg_bdf_data)}")
+
+print(f"  TXT:       {len(text_data)}")
+
+ 
+
+ 
+
+mne version = 1.9.0
+
+python version = 3.13.0
