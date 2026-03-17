@@ -3,7 +3,7 @@ numpy==2.1.0
 matplotlib==3.9.2
 seaborn==0.13.2
 scikit-learn==1.5.2
-mne==1.7.1
+mne==1.9.0
 pyedflib==0.1.42
 openpyxl==3.1.4
 xlrd==2.0.1
@@ -13,4 +13,3 @@ ipykernel==6.29.4
 scipy==1.14.1
 joblib==1.4.2
 tqdm==4.66.4
-# pybdf==0.2.5 requires gfortran + f2py to build its Fortran extension; see ecg.ipynb for setup instructions
