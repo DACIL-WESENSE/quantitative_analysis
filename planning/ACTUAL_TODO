@@ -9,4 +9,4 @@
 
 - In the wiki folder, start writing a technical documentation of the functions, where they are, and the reasoning behind them. Also give a background on the study, FAIR and GDPR compliance
 
-- Run quality checks of the code (will happen automatically when converting to .py)
+- Run quality checks of the code (will happen automatically when converting to .py due to GitHub)
