@@ -19,8 +19,9 @@ import os
 import pickle
 import re
 import csv
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib
 import mne
@@ -84,34 +85,264 @@ def configure(*, use_gpu: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 STAGE_ORDER: List[str] = ["Opwarmen", "Test", "VT1", "VT2", "Herstel"]
+VYNTUS_BREATHING_RATE_CANDIDATES: List[str] = [
+    "BF",
+    "Bf",
+    "bf",
+    "RR",
+    "Rr",
+    "rr",
+    "Breathing Frequency",
+    "Breathing Rate",
+    "Respiratory Rate",
+    "Ademfrequentie",
+]
+TELEMETRY_TIME_CANDIDATES: List[str] = [
+    "Tijd",
+    "tijd",
+    "Time",
+    "time",
+    "Timestamp",
+    "timestamp",
+    "Elapsed Time",
+    "elapsed_time",
+]
+
+_BDF_PATIENT_ID_RE = re.compile(
+    r"(WESENSETEST[_-]?[A-Z0-9]+)(?=(_L[12]_ECG|$))",
+    flags=re.IGNORECASE,
+)
+_WESENSE_PATIENT_ID_RE = re.compile(
+    r"(WESENSET[_-]?[A-Z0-9]+)",
+    flags=re.IGNORECASE,
+)
+_GENERIC_PATIENT_ID_RE = re.compile(
+    r"([A-Z][A-Z0-9_-]*\d+[A-Z0-9_-]*)",
+    flags=re.IGNORECASE,
+)
+
+_TASKS_LOG_SPLIT_RE = re.compile(r"[,\t;|]+")
+_TASKS_LOG_TIME_PREFIX_RE = re.compile(
+    r"^(?:timestamp|time|tijd|t)\s*[:=]\s*",
+    flags=re.IGNORECASE,
+)
+_TASKS_MARKER_COLUMNS = [
+    "line_number",
+    "timestamp_raw",
+    "timestamp_seconds",
+    "timestamp_datetime",
+    "event_code",
+    "label",
+    "marker_text",
+    "raw_line",
+    "parse_status",
+    "source_file",
+]
 
 # ---------------------------------------------------------------------------
 # 1. Directory parsing
 # ---------------------------------------------------------------------------
 
 
+def _natural_sort_key(value: str) -> Tuple:
+    """Return a case-insensitive natural-sort key for strings."""
+    parts = re.split(r"(\d+)", value)
+    return tuple(int(p) if p.isdigit() else p.lower() for p in parts)
+
+
+def _is_hidden_path(path: Path, root: Path) -> bool:
+    """Return ``True`` when *path* contains a hidden segment relative to *root*."""
+    try:
+        rel_parts = path.relative_to(root).parts
+    except ValueError:
+        rel_parts = path.parts
+    return any(part.startswith(".") for part in rel_parts)
+
+
+def _iter_files(root: Path, pattern: str) -> List[Path]:
+    """Return non-hidden files under *root* matching a glob pattern."""
+    return [
+        p for p in root.rglob(pattern)
+        if p.is_file() and not _is_hidden_path(p, root)
+    ]
+
+
+def _csv_looks_like_telemetry(csv_path: Path) -> bool:
+    """Heuristic check for WESENSE telemetry CSV structure."""
+    try:
+        with csv_path.open("r", encoding="utf-8", errors="replace") as handle:
+            sample = "".join(next(handle, "") for _ in range(6)).lower()
+    except OSError:
+        return False
+    return ("identificatie" in sample or "bezoekdatum" in sample) and "tijd" in sample
+
+
+def _extract_patient_id_from_info_df(info_df: Optional[pd.DataFrame]) -> Optional[str]:
+    """Extract raw patient identifier from telemetry metadata rows."""
+    if info_df is None or info_df.empty:
+        return None
+
+    # Primary format in WESENSE export: first row, second column.
+    try:
+        candidate = str(info_df.iloc[0, 1]).strip()
+        if candidate and candidate.lower() != "nan":
+            return candidate
+    except (IndexError, KeyError):
+        pass
+
+    # Fallback: scan key-value style rows.
+    for row in info_df.itertuples(index=False):
+        cells = [str(cell).strip() for cell in row]
+        for idx, key in enumerate(cells[:-1]):
+            key_l = key.lower()
+            if key_l.startswith("identificatie") or key_l.startswith("identification"):
+                value = cells[idx + 1].strip()
+                if value and value.lower() != "nan":
+                    return value
+    return None
+
+
+def _extract_patient_id_from_filename(path: Optional[Path]) -> Optional[str]:
+    """Extract raw patient identifier token from a telemetry/BDF filename."""
+    if path is None:
+        return None
+    stem = path.stem
+
+    for regex in (_BDF_PATIENT_ID_RE, _WESENSE_PATIENT_ID_RE, _GENERIC_PATIENT_ID_RE):
+        match = regex.search(stem)
+        if match:
+            return match.group(1)
+    return None
+
+
+def canonicalize_patient_id(patient_id: Optional[str]) -> Optional[str]:
+    """Normalize patient identifier into a canonical, filesystem-safe form."""
+    if patient_id is None:
+        return None
+
+    value = str(patient_id).strip()
+    if not value or value.lower() in {"nan", "none"}:
+        return None
+
+    value = re.sub(r"[\\/]+", "-", value)
+    value = re.sub(r"\s+", "_", value)
+    value = re.sub(r"[^A-Za-z0-9._-]", "", value)
+    value = re.sub(r"_+", "_", value).strip("._-")
+    if not value:
+        return None
+    return value.upper()
+
+
+def resolve_patient_id(
+    folder: Path,
+    info_df: Optional[pd.DataFrame] = None,
+    csv_path: Optional[Path] = None,
+    bdf_paths: Optional[Tuple[Optional[Path], Optional[Path]]] = None,
+) -> str:
+    """Resolve canonical patient identifier using metadata-first precedence.
+
+    Resolution precedence:
+    1) CSV metadata (``Identificatie``)
+    2) Telemetry CSV filename token
+    3) BDF filename token(s)
+    4) Folder name fallback
+    """
+    candidates: List[Tuple[str, Optional[str]]] = [
+        ("metadata", _extract_patient_id_from_info_df(info_df)),
+        ("csv_filename", _extract_patient_id_from_filename(csv_path)),
+    ]
+    if bdf_paths is not None:
+        for idx, bdf_path in enumerate(bdf_paths, start=1):
+            candidates.append((f"bdf_filename_{idx}", _extract_patient_id_from_filename(bdf_path)))
+    candidates.append(("folder_name", folder.name))
+
+    resolved: List[Tuple[str, str]] = []
+    for source, raw in candidates:
+        canonical = canonicalize_patient_id(raw)
+        if canonical:
+            resolved.append((source, canonical))
+
+    if not resolved:
+        logger.warning(
+            "Could not resolve patient ID for folder '%s'; using fallback UNKNOWN_PATIENT.",
+            folder,
+        )
+        return "UNKNOWN_PATIENT"
+
+    chosen = resolved[0][1]
+    unique_ids = []
+    for _, candidate in resolved:
+        if candidate not in unique_ids:
+            unique_ids.append(candidate)
+
+    if len(unique_ids) > 1:
+        logger.warning(
+            "Patient ID conflict for '%s': %s. Using '%s'.",
+            folder,
+            unique_ids,
+            chosen,
+        )
+
+    return chosen
+
+
 def discover_patient_folders(root_dir: str) -> List[Path]:
-    """Return all immediate sub-directories of *root_dir*.
+    """Discover patient folders recursively under *root_dir*.
 
     Parameters
     ----------
     root_dir : str
-        Path to the root data directory that contains one sub-folder per
-        patient/trial.
+        Path to the root data directory.
 
     Returns
     -------
     List[Path]
-        Sorted list of patient folder paths.
+        Deterministically sorted list of folders that contain telemetry CSV
+        files. If no CSV files are found, immediate sub-directories are
+        returned as a compatibility fallback.
     """
     root = Path(root_dir)
-    folders = sorted([p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")])
-    logger.info("Discovered %d patient folder(s) under '%s'.", len(folders), root_dir)
+    if not root.exists():
+        logger.warning("Data root '%s' does not exist.", root_dir)
+        return []
+
+    csv_files = _iter_files(root, "*.csv")
+    telemetry_csv_files = [p for p in csv_files if _csv_looks_like_telemetry(p)]
+    candidate_csv_files = telemetry_csv_files if telemetry_csv_files else csv_files
+    folders = sorted(
+        {csv_path.parent for csv_path in candidate_csv_files},
+        key=lambda p: _natural_sort_key(str(p.relative_to(root)).replace(os.sep, "/")),
+    )
+
+    if not folders:
+        folders = sorted(
+            [p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")],
+            key=lambda p: _natural_sort_key(p.name),
+        )
+        logger.info(
+            "Discovered %d immediate folder(s) under '%s' (no CSV files detected).",
+            len(folders),
+            root_dir,
+        )
+        return folders
+
+    if telemetry_csv_files:
+        logger.info(
+            "Discovered %d patient folder(s) with telemetry CSV data under '%s'.",
+            len(folders),
+            root_dir,
+        )
+    else:
+        logger.info(
+            "Discovered %d patient folder(s) with generic CSV data under '%s' (no telemetry headers detected).",
+            len(folders),
+            root_dir,
+        )
     return folders
 
 
 def find_bdf_files(folder: Path) -> Tuple[Optional[Path], Optional[Path]]:
-    """Find the L1 and L2 BDF ECG files inside *folder*.
+    """Find the L1 and L2 BDF ECG files inside *folder* (recursively).
 
     The expected naming pattern is::
 
@@ -131,18 +362,22 @@ def find_bdf_files(folder: Path) -> Tuple[Optional[Path], Optional[Path]]:
     l1_path: Optional[Path] = None
     l2_path: Optional[Path] = None
 
-    for bdf in folder.glob("*.bdf"):
+    bdf_files = sorted(
+        _iter_files(folder, "*.bdf"),
+        key=lambda p: _natural_sort_key(str(p.relative_to(folder)).replace(os.sep, "/")),
+    )
+    for bdf in bdf_files:
         name = bdf.name.upper()
-        if "_L1_ECG" in name:
+        if "_L1_ECG" in name and l1_path is None:
             l1_path = bdf
-        elif "_L2_ECG" in name:
+        elif "_L2_ECG" in name and l2_path is None:
             l2_path = bdf
 
     return l1_path, l2_path
 
 
 def find_csv_file(folder: Path) -> Optional[Path]:
-    """Return the first ``.csv`` file found in *folder*.
+    """Return the best telemetry ``.csv`` file found in *folder* recursively.
 
     Parameters
     ----------
@@ -152,10 +387,407 @@ def find_csv_file(folder: Path) -> Optional[Path]:
     Returns
     -------
     Optional[Path]
-        Path to the CSV file, or ``None`` if not found.
+        Path to the telemetry CSV file, or ``None`` if not found.
     """
-    files = list(folder.glob("*.csv"))
-    return files[0] if files else None
+    files = _iter_files(folder, "*.csv")
+    if not files:
+        return None
+
+    scored: List[Tuple[Tuple, Path]] = []
+    for path in files:
+        name_u = path.name.upper()
+        score = (
+            0 if _csv_looks_like_telemetry(path) else 1,
+            0 if "WESENSE" in name_u else 1,
+            1 if "ECG" in name_u else 0,
+            _natural_sort_key(str(path.relative_to(folder)).replace(os.sep, "/")),
+        )
+        scored.append((score, path))
+
+    scored.sort(key=lambda item: item[0])
+    return scored[0][1]
+
+
+def find_tasks_log_file(folder: Path) -> Optional[Path]:
+    """Return the first ``tasks.log`` file found in *folder* recursively.
+
+    Parameters
+    ----------
+    folder : Path
+        Patient folder to search.
+
+    Returns
+    -------
+    Optional[Path]
+        Path to ``tasks.log`` (case-insensitive), or ``None`` if absent.
+        If multiple files are found, the first file in deterministic sorted
+        order is returned and a warning is logged.
+    """
+    candidates = sorted(
+        [
+            path for path in _iter_files(folder, "*")
+            if path.name.lower() == "tasks.log"
+        ],
+        key=lambda p: _natural_sort_key(str(p.relative_to(folder)).replace(os.sep, "/")),
+    )
+    if not candidates:
+        return None
+
+    if len(candidates) > 1:
+        logger.warning(
+            "Multiple tasks.log files found in '%s'; using '%s'.",
+            folder,
+            candidates[0].relative_to(folder),
+        )
+    return candidates[0]
+
+
+def _split_key_value_token(token: str) -> Tuple[Optional[str], str]:
+    """Split a ``key=value`` / ``key:value`` token into key and value."""
+    value = str(token).strip()
+    match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_ ]*)\s*[:=]\s*(.*?)\s*$", value)
+    if not match:
+        return None, value
+
+    key = re.sub(r"\s+", "_", match.group(1).strip().lower())
+    return key, match.group(2).strip()
+
+
+def _normalize_marker_text(value: str) -> str:
+    """Lower-case marker text and collapse punctuation/whitespace."""
+    return re.sub(r"[^a-z0-9]+", " ", str(value).strip().lower()).strip()
+
+
+def _looks_like_tasks_header(tokens: List[str]) -> bool:
+    """Return ``True`` if *tokens* look like a tasks.log header row."""
+    normalized = [_normalize_marker_text(token) for token in tokens]
+    if not normalized:
+        return False
+
+    has_time_col = any(
+        token in {"timestamp", "time", "tijd", "t"} or "timestamp" in token
+        for token in normalized
+    )
+    has_payload_col = any(
+        token in {"event", "task", "code", "label", "description", "marker", "name"}
+        or "event" in token
+        or "label" in token
+        for token in normalized
+    )
+    return has_time_col and has_payload_col
+
+
+def _parse_tasks_timestamp(token: str) -> Tuple[Optional[float], Optional[datetime]]:
+    """Parse one tasks.log timestamp token into elapsed seconds or datetime."""
+    cleaned = _TASKS_LOG_TIME_PREFIX_RE.sub("", str(token).strip()).strip("[](){} ")
+    if not cleaned:
+        return None, None
+
+    numeric_candidate = cleaned.replace(",", ".")
+    if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", numeric_candidate):
+        return float(numeric_candidate), None
+
+    clock_match = re.fullmatch(
+        r"(?:(\d{1,3}):)?(\d{1,2}):(\d{1,2}(?:[.,]\d+)?)",
+        cleaned,
+    )
+    if clock_match:
+        hours = int(clock_match.group(1) or 0)
+        minutes = int(clock_match.group(2))
+        seconds = float(clock_match.group(3).replace(",", "."))
+        return hours * 3600.0 + minutes * 60.0 + seconds, None
+
+    dt = pd.to_datetime(cleaned, errors="coerce", utc=True, dayfirst=True)
+    if pd.notna(dt):
+        return None, dt.to_pydatetime()
+
+    return None, None
+
+
+def _extract_tasks_event_label(tokens: List[str]) -> Tuple[str, str]:
+    """Extract event code and label text from tokenized tasks.log payload."""
+    event_keys = {"event", "task", "code", "type", "action", "event_code"}
+    label_keys = {
+        "label", "description", "desc", "marker",
+        "name", "text", "marker_text", "event_label",
+    }
+
+    event_code = ""
+    label_parts: List[str] = []
+
+    for idx, token in enumerate(tokens):
+        key, value = _split_key_value_token(token)
+        value = value.strip()
+        if not value:
+            continue
+
+        if key in event_keys:
+            if not event_code:
+                event_code = value
+            else:
+                label_parts.append(value)
+            continue
+
+        if key in label_keys:
+            label_parts.append(value)
+            continue
+
+        if idx == 0 and len(tokens) > 1 and not event_code:
+            event_code = value
+        else:
+            label_parts.append(value)
+
+    return event_code.strip(), ", ".join(label_parts).strip()
+
+
+def parse_tasks_log(tasks_log_path: Path) -> pd.DataFrame:
+    """Parse a ``tasks.log`` file into structured marker rows.
+
+    The parser is intentionally permissive: it accepts comma/tab/semicolon/pipe
+    delimiters, optional key-value fields (for example ``time=12.5``), and
+    case-insensitive labels.
+
+    Parameters
+    ----------
+    tasks_log_path : Path
+        Path to the ``tasks.log`` file.
+
+    Returns
+    -------
+    pd.DataFrame
+        Parsed marker rows with columns in :data:`_TASKS_MARKER_COLUMNS`.
+    """
+    records: List[Dict] = []
+    time_keys = {"timestamp", "time", "tijd", "t", "ts"}
+
+    with tasks_log_path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            stripped = raw_line.strip().lstrip("\ufeff")
+            if not stripped or stripped.startswith("#") or stripped.startswith("//"):
+                continue
+
+            tokens = [tok.strip() for tok in _TASKS_LOG_SPLIT_RE.split(stripped) if tok.strip()]
+            if not tokens or _looks_like_tasks_header(tokens):
+                continue
+
+            timestamp_index: Optional[int] = None
+            timestamp_raw: Optional[str] = None
+            timestamp_seconds = float("nan")
+            timestamp_datetime: Optional[datetime] = None
+
+            for idx, token in enumerate(tokens):
+                key, value = _split_key_value_token(token)
+                if idx != 0 and key not in time_keys:
+                    continue
+
+                candidate = value if key in time_keys else token
+                seconds_value, datetime_value = _parse_tasks_timestamp(candidate)
+                if seconds_value is None and datetime_value is None:
+                    continue
+
+                timestamp_index = idx
+                timestamp_raw = candidate.strip()
+                timestamp_seconds = float(seconds_value) if seconds_value is not None else float("nan")
+                timestamp_datetime = datetime_value
+                break
+
+            payload_tokens = [
+                tok for idx, tok in enumerate(tokens) if idx != timestamp_index
+            ] if timestamp_index is not None else tokens
+            event_code, label = _extract_tasks_event_label(payload_tokens)
+            marker_text = ", ".join(part for part in [event_code, label] if part).strip()
+            if not marker_text:
+                marker_text = stripped
+
+            records.append(
+                {
+                    "line_number": line_number,
+                    "timestamp_raw": timestamp_raw,
+                    "timestamp_seconds": timestamp_seconds,
+                    "timestamp_datetime": timestamp_datetime,
+                    "event_code": event_code,
+                    "label": label,
+                    "marker_text": marker_text,
+                    "raw_line": stripped,
+                    "parse_status": "ok" if timestamp_index is not None else "missing_timestamp",
+                    "source_file": str(tasks_log_path),
+                }
+            )
+
+    if not records:
+        logger.warning(
+            "tasks.log '%s' contained no marker rows after parsing.",
+            tasks_log_path,
+        )
+        return pd.DataFrame(columns=_TASKS_MARKER_COLUMNS)
+
+    markers_df = pd.DataFrame.from_records(records, columns=_TASKS_MARKER_COLUMNS)
+    markers_df["timestamp_datetime"] = pd.to_datetime(
+        markers_df["timestamp_datetime"], errors="coerce", utc=True
+    )
+    markers_df["timestamp_seconds"] = pd.to_numeric(
+        markers_df["timestamp_seconds"], errors="coerce"
+    )
+
+    # If timestamps are absolute datetimes, derive a seconds axis from the first
+    # datetime marker for rows that do not already provide seconds.
+    valid_datetime = markers_df["timestamp_datetime"].notna()
+    if valid_datetime.any():
+        datetime_ref = markers_df.loc[valid_datetime, "timestamp_datetime"].min()
+        datetime_seconds = pd.Series(np.nan, index=markers_df.index, dtype=float)
+        datetime_seconds.loc[valid_datetime] = (
+            markers_df.loc[valid_datetime, "timestamp_datetime"] - datetime_ref
+        ).dt.total_seconds()
+        missing_seconds = valid_datetime & markers_df["timestamp_seconds"].isna()
+        markers_df.loc[missing_seconds, "timestamp_seconds"] = datetime_seconds.loc[missing_seconds]
+
+    logger.info(
+        "Parsed %d marker row(s) from '%s'.",
+        len(markers_df),
+        tasks_log_path.name,
+    )
+    return markers_df
+
+
+def _build_tasks_marker_match_mask(
+    markers_df: pd.DataFrame,
+    event_code: str,
+    label_contains: str,
+) -> pd.Series:
+    """Build a boolean mask for markers matching event + label criteria."""
+    if markers_df.empty:
+        return pd.Series(False, index=markers_df.index, dtype=bool)
+
+    idx = markers_df.index
+    event_series = markers_df.get("event_code", pd.Series("", index=idx, dtype=object))
+    label_series = markers_df.get("label", pd.Series("", index=idx, dtype=object))
+    text_series = markers_df.get("marker_text", pd.Series("", index=idx, dtype=object))
+
+    event_norm = event_series.fillna("").astype(str).map(_normalize_marker_text)
+    label_norm = label_series.fillna("").astype(str).map(_normalize_marker_text)
+    text_norm = text_series.fillna("").astype(str).map(_normalize_marker_text)
+
+    target_event = _normalize_marker_text(event_code)
+    target_label = _normalize_marker_text(label_contains)
+
+    has_event = event_norm.eq(target_event) | text_norm.str.contains(
+        target_event, regex=False, na=False
+    )
+    has_label = label_norm.str.contains(target_label, regex=False, na=False) | text_norm.str.contains(
+        target_label, regex=False, na=False
+    )
+    return has_event & has_label
+
+
+def find_tasks_marker_timestamp(
+    markers_df: pd.DataFrame,
+    event_code: str,
+    label_contains: str,
+) -> Optional[float]:
+    """Return the earliest marker timestamp that matches event + label.
+
+    Parameters
+    ----------
+    markers_df : pd.DataFrame
+        Parsed marker rows from :func:`parse_tasks_log`.
+    event_code : str
+        Event token to match (case-insensitive).
+    label_contains : str
+        Required label substring (case-insensitive).
+
+    Returns
+    -------
+    Optional[float]
+        Earliest matching timestamp in seconds, or ``None`` if no match exists.
+    """
+    if markers_df.empty:
+        return None
+
+    timestamp_seconds = pd.to_numeric(
+        markers_df.get("timestamp_seconds"), errors="coerce"
+    )
+    if timestamp_seconds.isna().all():
+        return None
+
+    matches = _build_tasks_marker_match_mask(
+        markers_df, event_code=event_code, label_contains=label_contains
+    ) & timestamp_seconds.notna()
+    if not matches.any():
+        return None
+
+    return float(timestamp_seconds.loc[matches].min())
+
+
+def trim_raw_before_timestamp(
+    raw: mne.io.BaseRaw,
+    start_seconds: Optional[float],
+    source_name: str = "BDF",
+) -> mne.io.BaseRaw:
+    """Trim samples before *start_seconds* from a Raw recording.
+
+    Parameters
+    ----------
+    raw : mne.io.BaseRaw
+        Loaded MNE Raw object.
+    start_seconds : Optional[float]
+        Marker timestamp in seconds from start of recording.
+    source_name : str
+        Label used in log messages.
+
+    Returns
+    -------
+    mne.io.BaseRaw
+        Cropped copy when a valid marker is provided, otherwise the input raw
+        object unchanged.
+    """
+    if start_seconds is None:
+        return raw
+    if not np.isfinite(start_seconds):
+        logger.warning(
+            "%s: invalid start marker '%s'; using untrimmed ECG.",
+            source_name,
+            start_seconds,
+        )
+        return raw
+
+    tmin = float(start_seconds)
+    if tmin <= 0.0:
+        logger.info("%s: start marker <= 0 s; no ECG trimming applied.", source_name)
+        return raw
+
+    duration = float(raw.times[-1]) if raw.n_times > 0 else 0.0
+    if duration <= 0.0:
+        logger.warning("%s: empty ECG recording; trimming skipped.", source_name)
+        return raw
+    if tmin >= duration:
+        logger.warning(
+            "%s: start marker %.3f s exceeds recording duration %.3f s; "
+            "using untrimmed ECG.",
+            source_name,
+            tmin,
+            duration,
+        )
+        return raw
+
+    trimmed = raw.copy().crop(tmin=tmin, tmax=None)
+    trimmed_duration = float(trimmed.times[-1]) if trimmed.n_times > 0 else 0.0
+    logger.info(
+        "%s: trimmed %.3f s before marker (duration %.3f s -> %.3f s).",
+        source_name,
+        tmin,
+        duration,
+        trimmed_duration,
+    )
+    return trimmed
+
+
+def _normalise_checkpoint_cache_key(cache_key: Optional[str]) -> str:
+    """Return a filesystem-safe checkpoint cache key suffix."""
+    if cache_key is None:
+        return ""
+
+    safe_key = re.sub(r"[^A-Za-z0-9._-]+", "_", str(cache_key)).strip("._-")
+    return f"_{safe_key}" if safe_key else ""
 
 
 # ---------------------------------------------------------------------------
@@ -249,13 +881,19 @@ def _parse_telemetry(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def load_ecg(bdf_path: Path) -> Optional[mne.io.BaseRaw]:
+def load_ecg(
+    bdf_path: Path,
+    start_seconds: Optional[float] = None,
+) -> Optional[mne.io.BaseRaw]:
     """Load a BDF ECG file with MNE and return the Raw object.
 
     Parameters
     ----------
     bdf_path : Path
         Path to the ``.bdf`` file.
+    start_seconds : Optional[float]
+        Optional marker timestamp in seconds from recording start. When
+        provided, samples before this timestamp are trimmed.
 
     Returns
     -------
@@ -264,6 +902,11 @@ def load_ecg(bdf_path: Path) -> Optional[mne.io.BaseRaw]:
     """
     try:
         raw = mne.io.read_raw_bdf(str(bdf_path), preload=False, verbose=False)
+        raw = trim_raw_before_timestamp(
+            raw,
+            start_seconds=start_seconds,
+            source_name=bdf_path.name,
+        )
         logger.info("Loaded BDF: %s  (%.1f s)", bdf_path.name, raw.times[-1])
         return raw
     except (ValueError, OSError, RuntimeError) as exc:
@@ -558,7 +1201,10 @@ def extract_ecg_timeseries_array(
 
 
 def save_ecg_checkpoint(
-    features: pd.DataFrame, patient_out: Path, label: str
+    features: pd.DataFrame,
+    patient_out: Path,
+    label: str,
+    cache_key: Optional[str] = None,
 ) -> None:
     """Persist ECG feature DataFrame to a pickle checkpoint file.
 
@@ -570,16 +1216,23 @@ def save_ecg_checkpoint(
         Per-patient output directory (created if it does not exist).
     label : str
         BDF label, e.g. ``"L1"`` or ``"L2"``.
+    cache_key : Optional[str]
+        Optional suffix that namespaces checkpoints for different preprocessing
+        variants (for example task-marker alignment state).
     """
     patient_out.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = patient_out / f"ecg_checkpoint_{label}.pkl"
+    checkpoint_suffix = _normalise_checkpoint_cache_key(cache_key)
+    checkpoint_path = patient_out / f"ecg_checkpoint_{label}{checkpoint_suffix}.pkl"
     with open(checkpoint_path, "wb") as fh:
         pickle.dump(features, fh)
     logger.info("ECG checkpoint saved: %s", checkpoint_path)
 
 
 def load_ecg_checkpoint(
-    patient_out: Path, label: str
+    patient_out: Path,
+    label: str,
+    cache_key: Optional[str] = None,
+    fallback_to_legacy: bool = True,
 ) -> Optional[pd.DataFrame]:
     """Load a pickled ECG feature DataFrame from a checkpoint file.
 
@@ -589,19 +1242,509 @@ def load_ecg_checkpoint(
         Per-patient output directory.
     label : str
         BDF label, e.g. ``"L1"`` or ``"L2"``.
+    cache_key : Optional[str]
+        Optional suffix that namespaces checkpoints for different preprocessing
+        variants (for example task-marker alignment state).
+    fallback_to_legacy : bool
+        If ``True`` and a keyed checkpoint does not exist, try loading the
+        legacy checkpoint name without a suffix.
 
     Returns
     -------
     Optional[pd.DataFrame]
         The cached feature DataFrame, or ``None`` if no checkpoint exists.
     """
-    checkpoint_path = patient_out / f"ecg_checkpoint_{label}.pkl"
+    checkpoint_suffix = _normalise_checkpoint_cache_key(cache_key)
+    checkpoint_path = patient_out / f"ecg_checkpoint_{label}{checkpoint_suffix}.pkl"
     if not checkpoint_path.exists():
-        return None
+        if cache_key is not None and fallback_to_legacy:
+            legacy_path = patient_out / f"ecg_checkpoint_{label}.pkl"
+            if legacy_path.exists():
+                checkpoint_path = legacy_path
+            else:
+                return None
+        else:
+            return None
     with open(checkpoint_path, "rb") as fh:
         features = pickle.load(fh)
     logger.info("ECG checkpoint loaded: %s", checkpoint_path)
     return features
+
+
+def save_ecg_timeseries_checkpoint(
+    features: pd.DataFrame,
+    patient_out: Path,
+    label: str,
+    cache_key: Optional[str] = None,
+) -> None:
+    """Persist ECG time-series feature DataFrame to a checkpoint file.
+
+    Parameters
+    ----------
+    features : pd.DataFrame
+        Output from :func:`extract_ecg_timeseries`.
+    patient_out : Path
+        Per-patient output directory (created if it does not exist).
+    label : str
+        BDF label, e.g. ``"L1"`` or ``"L2"``.
+    cache_key : Optional[str]
+        Optional suffix that namespaces checkpoints for different preprocessing
+        variants (for example task-marker alignment state).
+    """
+    patient_out.mkdir(parents=True, exist_ok=True)
+    checkpoint_suffix = _normalise_checkpoint_cache_key(cache_key)
+    checkpoint_path = patient_out / f"ecg_timeseries_checkpoint_{label}{checkpoint_suffix}.pkl"
+    with open(checkpoint_path, "wb") as fh:
+        pickle.dump(features, fh)
+    logger.info("ECG time-series checkpoint saved: %s", checkpoint_path)
+
+
+def load_ecg_timeseries_checkpoint(
+    patient_out: Path,
+    label: str,
+    cache_key: Optional[str] = None,
+    fallback_to_legacy: bool = True,
+) -> Optional[pd.DataFrame]:
+    """Load cached ECG time-series features from checkpoint file.
+
+    Parameters
+    ----------
+    patient_out : Path
+        Per-patient output directory.
+    label : str
+        BDF label, e.g. ``"L1"`` or ``"L2"``.
+    cache_key : Optional[str]
+        Optional suffix that namespaces checkpoints for different preprocessing
+        variants (for example task-marker alignment state).
+    fallback_to_legacy : bool
+        If ``True`` and a keyed checkpoint does not exist, try loading the
+        legacy checkpoint name without a suffix.
+
+    Returns
+    -------
+    Optional[pd.DataFrame]
+        The cached time-series feature DataFrame, or ``None`` if not found.
+    """
+    checkpoint_suffix = _normalise_checkpoint_cache_key(cache_key)
+    checkpoint_path = patient_out / f"ecg_timeseries_checkpoint_{label}{checkpoint_suffix}.pkl"
+    if not checkpoint_path.exists():
+        if cache_key is not None and fallback_to_legacy:
+            legacy_path = patient_out / f"ecg_timeseries_checkpoint_{label}.pkl"
+            if legacy_path.exists():
+                checkpoint_path = legacy_path
+            else:
+                return None
+        else:
+            return None
+    with open(checkpoint_path, "rb") as fh:
+        features = pickle.load(fh)
+    logger.info("ECG time-series checkpoint loaded: %s", checkpoint_path)
+    return features
+
+
+def _parse_telemetry_time_to_seconds(value: object) -> float:
+    """Convert telemetry time-like string values to elapsed seconds.
+
+    Parameters
+    ----------
+    value : object
+        Input cell value (typically from telemetry time column).
+
+    Returns
+    -------
+    float
+        Elapsed seconds, or ``float('nan')`` when parsing fails.
+    """
+    if value is None:
+        return float("nan")
+    if isinstance(value, (int, float)) and np.isfinite(value):
+        return float(value)
+
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none"}:
+        return float("nan")
+
+    text = text.replace(",", ".")
+
+    # HH:MM(:SS) values without a day prefix.
+    if re.match(r"^\d{1,2}:\d{2}(:\d{2}(?:\.\d+)?)?$", text):
+        parts = text.split(":")
+        try:
+            if len(parts) == 2:
+                return float(int(parts[0]) * 60 + float(parts[1]))
+            if len(parts) == 3:
+                return float(int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2]))
+        except ValueError:
+            return float("nan")
+
+    td = pd.to_timedelta(text, errors="coerce")
+    if pd.isna(td):
+        return float("nan")
+    return float(td.total_seconds())
+
+
+def _prepare_vyntus_breathing_series(
+    telemetry_df: pd.DataFrame,
+    patient_id: str,
+) -> Tuple[Optional[str], pd.DataFrame]:
+    """Extract measured Vyntus breathing-rate time series from telemetry.
+
+    Parameters
+    ----------
+    telemetry_df : pd.DataFrame
+        Cleaned telemetry DataFrame.
+    patient_id : str
+        Patient identifier for logging context.
+
+    Returns
+    -------
+    Tuple[Optional[str], pd.DataFrame]
+        ``(column_name, series_df)`` where *series_df* has columns
+        ``time_s`` and ``measured_br_bpm``.  Returns ``(None, empty_df)``
+        when required columns are unavailable or contain no usable data.
+    """
+    br_col = _find_column(telemetry_df, VYNTUS_BREATHING_RATE_CANDIDATES)
+    if br_col is None:
+        logger.warning(
+            "%s: measured Vyntus breathing-rate column not found. Tried: %s",
+            patient_id,
+            VYNTUS_BREATHING_RATE_CANDIDATES,
+        )
+        return None, pd.DataFrame(columns=["time_s", "measured_br_bpm"])
+
+    time_col = _find_column(telemetry_df, TELEMETRY_TIME_CANDIDATES)
+    if time_col is None:
+        logger.warning(
+            "%s: telemetry time column not found for breathing-rate validation. Tried: %s",
+            patient_id,
+            TELEMETRY_TIME_CANDIDATES,
+        )
+        return br_col, pd.DataFrame(columns=["time_s", "measured_br_bpm"])
+
+    measured = pd.to_numeric(
+        telemetry_df[br_col].astype(str).str.replace(",", ".", regex=False),
+        errors="coerce",
+    )
+    times = telemetry_df[time_col].apply(_parse_telemetry_time_to_seconds)
+
+    series_df = pd.DataFrame(
+        {
+            "time_s": times,
+            "measured_br_bpm": measured,
+        }
+    )
+    series_df = series_df.replace([np.inf, -np.inf], np.nan).dropna(subset=["time_s", "measured_br_bpm"])
+    series_df = series_df.sort_values("time_s").drop_duplicates(subset=["time_s"], keep="last")
+
+    if series_df.empty:
+        logger.warning(
+            "%s: no valid measured Vyntus breathing-rate samples after parsing columns (%s, %s).",
+            patient_id,
+            br_col,
+            time_col,
+        )
+        return br_col, pd.DataFrame(columns=["time_s", "measured_br_bpm"])
+
+    return br_col, series_df
+
+
+def _prepare_ecg_breathing_series(
+    ecg_timeseries: pd.DataFrame,
+    patient_id: str,
+) -> pd.DataFrame:
+    """Aggregate ECG-derived breathing-rate time series across channels.
+
+    Parameters
+    ----------
+    ecg_timeseries : pd.DataFrame
+        ECG time-series features with ``time_s`` and ``breathing_rate_bpm``.
+    patient_id : str
+        Patient identifier for logging context.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with columns ``time_s`` and ``calculated_br_bpm``.
+        Empty when required columns are missing or no valid rows remain.
+    """
+    required = {"time_s", "breathing_rate_bpm"}
+    if ecg_timeseries.empty:
+        logger.warning("%s: ECG time-series is empty, cannot validate breathing rate.", patient_id)
+        return pd.DataFrame(columns=["time_s", "calculated_br_bpm"])
+    if not required.issubset(ecg_timeseries.columns):
+        logger.warning(
+            "%s: ECG time-series missing required columns %s; found %s.",
+            patient_id,
+            sorted(required),
+            sorted(ecg_timeseries.columns.tolist()),
+        )
+        return pd.DataFrame(columns=["time_s", "calculated_br_bpm"])
+
+    calc_df = ecg_timeseries[["time_s", "breathing_rate_bpm"]].copy()
+    calc_df["time_s"] = pd.to_numeric(calc_df["time_s"], errors="coerce")
+    calc_df["breathing_rate_bpm"] = pd.to_numeric(calc_df["breathing_rate_bpm"], errors="coerce")
+    calc_df = calc_df.replace([np.inf, -np.inf], np.nan).dropna()
+
+    if calc_df.empty:
+        logger.warning(
+            "%s: no valid ECG-derived breathing-rate samples after numeric coercion.",
+            patient_id,
+        )
+        return pd.DataFrame(columns=["time_s", "calculated_br_bpm"])
+
+    calc_df = (
+        calc_df.groupby("time_s", as_index=False)["breathing_rate_bpm"]
+        .mean()
+        .rename(columns={"breathing_rate_bpm": "calculated_br_bpm"})
+        .sort_values("time_s")
+    )
+    return calc_df
+
+
+def align_breathing_rate_series(
+    calculated_df: pd.DataFrame,
+    measured_df: pd.DataFrame,
+    tolerance_s: float = 20.0,
+) -> pd.DataFrame:
+    """Align calculated and measured breathing-rate series by nearest timestamp.
+
+    Parameters
+    ----------
+    calculated_df : pd.DataFrame
+        DataFrame with columns ``time_s`` and ``calculated_br_bpm``.
+    measured_df : pd.DataFrame
+        DataFrame with columns ``time_s`` and ``measured_br_bpm``.
+    tolerance_s : float
+        Maximum absolute time difference allowed for nearest-neighbour match.
+
+    Returns
+    -------
+    pd.DataFrame
+        Aligned DataFrame with columns:
+        ``time_s_calc``, ``time_s_measured``, ``time_delta_s``,
+        ``calculated_br_bpm``, ``measured_br_bpm``.
+    """
+    if calculated_df.empty or measured_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "time_s_calc",
+                "time_s_measured",
+                "time_delta_s",
+                "calculated_br_bpm",
+                "measured_br_bpm",
+            ]
+        )
+
+    left = calculated_df.sort_values("time_s").rename(columns={"time_s": "time_s_calc"})
+    right = measured_df.sort_values("time_s").rename(columns={"time_s": "time_s_measured"})
+    left["time_s_calc"] = pd.to_numeric(left["time_s_calc"], errors="coerce").astype(float)
+    right["time_s_measured"] = pd.to_numeric(right["time_s_measured"], errors="coerce").astype(float)
+    left = left.dropna(subset=["time_s_calc"])
+    right = right.dropna(subset=["time_s_measured"])
+    if left.empty or right.empty:
+        return pd.DataFrame(
+            columns=[
+                "time_s_calc",
+                "time_s_measured",
+                "time_delta_s",
+                "calculated_br_bpm",
+                "measured_br_bpm",
+            ]
+        )
+
+    aligned = pd.merge_asof(
+        left,
+        right,
+        left_on="time_s_calc",
+        right_on="time_s_measured",
+        direction="nearest",
+        tolerance=tolerance_s,
+    )
+    aligned = aligned.dropna(subset=["time_s_measured"]).copy()
+    if aligned.empty:
+        return pd.DataFrame(
+            columns=[
+                "time_s_calc",
+                "time_s_measured",
+                "time_delta_s",
+                "calculated_br_bpm",
+                "measured_br_bpm",
+            ]
+        )
+
+    aligned["time_delta_s"] = (aligned["time_s_calc"] - aligned["time_s_measured"]).abs()
+    return aligned[
+        [
+            "time_s_calc",
+            "time_s_measured",
+            "time_delta_s",
+            "calculated_br_bpm",
+            "measured_br_bpm",
+        ]
+    ]
+
+
+def compute_breathing_rate_comparison(
+    aligned_df: pd.DataFrame,
+) -> Dict[str, float]:
+    """Compute agreement/error metrics for aligned breathing-rate series.
+
+    Parameters
+    ----------
+    aligned_df : pd.DataFrame
+        Output from :func:`align_breathing_rate_series`.
+
+    Returns
+    -------
+    Dict[str, float]
+        Metrics dictionary with sample count, means, bias and error metrics.
+        Values are ``float('nan')`` when not computable.
+    """
+    nan = float("nan")
+    metrics: Dict[str, float] = {
+        "breathing_rate_n_aligned": 0.0,
+        "breathing_rate_mean_calculated_bpm": nan,
+        "breathing_rate_mean_measured_bpm": nan,
+        "breathing_rate_bias_bpm": nan,
+        "breathing_rate_mae_bpm": nan,
+        "breathing_rate_rmse_bpm": nan,
+        "breathing_rate_mape_pct": nan,
+        "breathing_rate_corr": nan,
+        "breathing_rate_mean_abs_time_delta_s": nan,
+    }
+    if aligned_df.empty:
+        return metrics
+
+    calc = pd.to_numeric(aligned_df["calculated_br_bpm"], errors="coerce")
+    meas = pd.to_numeric(aligned_df["measured_br_bpm"], errors="coerce")
+    valid = pd.DataFrame({"calc": calc, "meas": meas}).dropna()
+    n = len(valid)
+    metrics["breathing_rate_n_aligned"] = float(n)
+    if n == 0:
+        return metrics
+
+    err = valid["calc"] - valid["meas"]
+    metrics["breathing_rate_mean_calculated_bpm"] = float(valid["calc"].mean())
+    metrics["breathing_rate_mean_measured_bpm"] = float(valid["meas"].mean())
+    metrics["breathing_rate_bias_bpm"] = float(err.mean())
+    metrics["breathing_rate_mae_bpm"] = float(np.abs(err).mean())
+    metrics["breathing_rate_rmse_bpm"] = float(np.sqrt(np.mean(err ** 2)))
+
+    nonzero = valid["meas"] != 0
+    if nonzero.any():
+        metrics["breathing_rate_mape_pct"] = float(
+            np.mean(np.abs(err[nonzero] / valid.loc[nonzero, "meas"])) * 100.0
+        )
+
+    if n >= 2 and valid["calc"].nunique() > 1 and valid["meas"].nunique() > 1:
+        metrics["breathing_rate_corr"] = float(valid["calc"].corr(valid["meas"]))
+
+    if "time_delta_s" in aligned_df.columns:
+        td = pd.to_numeric(aligned_df["time_delta_s"], errors="coerce").dropna()
+        if not td.empty:
+            metrics["breathing_rate_mean_abs_time_delta_s"] = float(td.mean())
+
+    return metrics
+
+
+def evaluate_breathing_rate_validation(
+    telemetry_df: pd.DataFrame,
+    ecg_timeseries: pd.DataFrame,
+    patient_id: str,
+    output_dir: Optional[Path] = None,
+    alignment_tolerance_s: float = 20.0,
+) -> Tuple[Dict[str, Any], pd.DataFrame]:
+    """Validate ECG-derived breathing rate against Vyntus telemetry values.
+
+    Parameters
+    ----------
+    telemetry_df : pd.DataFrame
+        Cleaned telemetry DataFrame containing measured Vyntus columns.
+    ecg_timeseries : pd.DataFrame
+        Time-resolved ECG feature DataFrame from
+        :func:`extract_ecg_timeseries` or equivalent.
+    patient_id : str
+        Identifier used in logging and optional saved filename.
+    output_dir : Optional[Path]
+        If provided, aligned comparison rows are written to CSV.
+    alignment_tolerance_s : float
+        Max absolute time difference allowed when aligning time series.
+
+    Returns
+    -------
+    Tuple[Dict[str, Any], pd.DataFrame]
+        ``(metrics, aligned_df)`` where *metrics* includes both scalar metrics
+        and provenance keys:
+        ``breathing_rate_calc_source``, ``breathing_rate_measured_source_column``,
+        ``breathing_rate_validation_status``.
+    """
+    metrics: Dict[str, Any] = {
+        "breathing_rate_calc_source": "ecg_edr_breathing_rate_bpm",
+        "breathing_rate_measured_source_column": None,
+        "breathing_rate_validation_status": "not_evaluated",
+    }
+    empty_aligned = pd.DataFrame(
+        columns=[
+            "time_s_calc",
+            "time_s_measured",
+            "time_delta_s",
+            "calculated_br_bpm",
+            "measured_br_bpm",
+        ]
+    )
+
+    measured_col, measured_df = _prepare_vyntus_breathing_series(telemetry_df, patient_id)
+    metrics["breathing_rate_measured_source_column"] = measured_col
+    calc_df = _prepare_ecg_breathing_series(ecg_timeseries, patient_id)
+
+    if measured_df.empty or calc_df.empty:
+        metrics.update(compute_breathing_rate_comparison(empty_aligned))
+        metrics["breathing_rate_validation_status"] = "missing_data"
+        if output_dir is not None:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            out_path = output_dir / f"{patient_id}_breathing_rate_validation.csv"
+            empty_aligned.to_csv(out_path, index=False)
+            logger.info("Saved breathing-rate validation CSV: %s", out_path)
+        return metrics, empty_aligned
+
+    aligned_df = align_breathing_rate_series(
+        calc_df,
+        measured_df,
+        tolerance_s=alignment_tolerance_s,
+    )
+    if aligned_df.empty:
+        logger.warning(
+            "%s: no aligned breathing-rate samples within %.1f s tolerance.",
+            patient_id,
+            alignment_tolerance_s,
+        )
+        metrics.update(compute_breathing_rate_comparison(aligned_df))
+        metrics["breathing_rate_validation_status"] = "no_aligned_samples"
+        if output_dir is not None:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            out_path = output_dir / f"{patient_id}_breathing_rate_validation.csv"
+            aligned_df.to_csv(out_path, index=False)
+            logger.info("Saved breathing-rate validation CSV: %s", out_path)
+        return metrics, aligned_df
+
+    metrics.update(compute_breathing_rate_comparison(aligned_df))
+    metrics["breathing_rate_validation_status"] = "ok"
+
+    if output_dir is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out_path = output_dir / f"{patient_id}_breathing_rate_validation.csv"
+        aligned_df.to_csv(out_path, index=False)
+        logger.info("Saved breathing-rate validation CSV: %s", out_path)
+
+    logger.info(
+        "%s: breathing-rate validation (%d aligned points) MAE=%.2f bpm RMSE=%.2f bpm Bias=%.2f bpm.",
+        patient_id,
+        int(metrics.get("breathing_rate_n_aligned", 0.0) or 0.0),
+        metrics.get("breathing_rate_mae_bpm", float("nan")),
+        metrics.get("breathing_rate_rmse_bpm", float("nan")),
+        metrics.get("breathing_rate_bias_bpm", float("nan")),
+    )
+    return metrics, aligned_df
 
 
 def _estimate_hr_from_signal(signal: np.ndarray, sfreq: float) -> float:
@@ -996,8 +2139,9 @@ def process_patient(
         ``telemetry_df`` (DataFrame).  Returns ``None`` and logs an error
         if processing fails.
     """
-    patient_id = folder.name
-    logger.info("Processing patient: %s", patient_id)
+    folder_patient_id = canonicalize_patient_id(folder.name) or "UNKNOWN_PATIENT"
+    logger.info("Processing patient folder: %s", folder_patient_id)
+    patient_id = folder_patient_id
     patient_out = output_base / patient_id
 
     try:
@@ -1006,15 +2150,78 @@ def process_patient(
         if csv_path is None:
             raise FileNotFoundError(f"No CSV file found in {folder}")
 
+        l1_path, l2_path = find_bdf_files(folder)
+        ecg_file_present = l1_path is not None or l2_path is not None
+
         info_df, telemetry_df = load_telemetry(csv_path)
+        patient_id = resolve_patient_id(
+            folder,
+            info_df=info_df,
+            csv_path=csv_path,
+            bdf_paths=(l1_path, l2_path),
+        )
+        patient_out = output_base / patient_id
+        logger.info("Resolved patient ID: %s", patient_id)
         logger.info("  %s — telemetry: %d rows × %d cols",
                     patient_id, *telemetry_df.shape)
 
+        marker_start_seconds: Optional[float] = None
+        marker_start_found = False
+        marker_rows_parsed = 0
+        marker_rows_timestamped = 0
+        marker_output_path: Optional[Path] = None
+        tasks_log_path = find_tasks_log_file(folder)
+        tasks_markers_df = pd.DataFrame(columns=_TASKS_MARKER_COLUMNS)
+
+        if tasks_log_path is None:
+            logger.warning(
+                "%s: tasks.log not found; ECG alignment marker unavailable.",
+                patient_id,
+            )
+        else:
+            logger.info("%s: found tasks.log at '%s'.", patient_id, tasks_log_path)
+            tasks_markers_df = parse_tasks_log(tasks_log_path)
+            marker_rows_parsed = int(len(tasks_markers_df))
+            marker_rows_timestamped = int(
+                pd.to_numeric(
+                    tasks_markers_df.get("timestamp_seconds"), errors="coerce"
+                ).notna().sum()
+            )
+            marker_start_seconds = find_tasks_marker_timestamp(
+                tasks_markers_df,
+                event_code="start",
+                label_contains="start on vyntus cpx",
+            )
+            marker_start_found = marker_start_seconds is not None
+
+            if marker_start_found:
+                logger.info(
+                    "%s: using tasks marker start,Start on Vyntus CPX at %.3f s.",
+                    patient_id,
+                    float(marker_start_seconds),
+                )
+            else:
+                logger.warning(
+                    "%s: marker 'start,Start on Vyntus CPX' not found or missing timestamp; "
+                    "ECG will not be trimmed.",
+                    patient_id,
+                )
+        marker_output_path = save_tasks_markers_csv(
+            tasks_markers_df,
+            patient_id=patient_id,
+            output_dir=patient_out,
+        )
+
         # ── Load / extract ECG features ───────────────────────────────────
         ecg_features = pd.DataFrame()
+        ecg_timeseries = pd.DataFrame()
+        breathing_rate_metrics: Optional[Dict[str, Any]] = None
         if not skip_ecg:
-            l1_path, l2_path = find_bdf_files(folder)
             ecg_features_list = []
+            ecg_timeseries_list = []
+            marker_cache_key: Optional[str] = None
+            if marker_start_seconds is not None:
+                marker_cache_key = f"aligned_{marker_start_seconds:.3f}s"
 
             for bdf_label, bdf_path in [("L1", l1_path), ("L2", l2_path)]:
                 if bdf_path is None:
@@ -1022,28 +2229,107 @@ def process_patient(
                     continue
 
                 feats = None
+                ts_feats = None
                 if use_ecg_checkpoint:
-                    feats = load_ecg_checkpoint(patient_out, bdf_label)
+                    feats = load_ecg_checkpoint(
+                        patient_out,
+                        bdf_label,
+                        cache_key=marker_cache_key,
+                        fallback_to_legacy=marker_cache_key is None,
+                    )
+                    ts_feats = load_ecg_timeseries_checkpoint(
+                        patient_out,
+                        bdf_label,
+                        cache_key=marker_cache_key,
+                        fallback_to_legacy=marker_cache_key is None,
+                    )
 
-                if feats is None:
-                    raw = load_ecg(bdf_path)
-                    if raw is not None:
-                        feats = extract_ecg_features(raw)
-                        save_ecg_checkpoint(feats, patient_out, bdf_label)
+                raw = None
+                if feats is None or ts_feats is None:
+                    raw = load_ecg(
+                        bdf_path,
+                        start_seconds=marker_start_seconds,
+                    )
+                    if raw is None:
+                        logger.warning(
+                            "  %s — %s BDF could not be loaded for ECG processing.",
+                            patient_id,
+                            bdf_label,
+                        )
+
+                if raw is not None and feats is None:
+                    feats = extract_ecg_features(raw)
+                    save_ecg_checkpoint(
+                        feats,
+                        patient_out,
+                        bdf_label,
+                        cache_key=marker_cache_key,
+                    )
+                if raw is not None and ts_feats is None:
+                    ts_feats = extract_ecg_timeseries(raw)
+                    save_ecg_timeseries_checkpoint(
+                        ts_feats,
+                        patient_out,
+                        bdf_label,
+                        cache_key=marker_cache_key,
+                    )
 
                 if feats is not None:
                     feats = feats.copy()
                     feats["bdf_label"] = bdf_label
                     ecg_features_list.append(feats)
+                if ts_feats is not None:
+                    ts_feats = ts_feats.copy()
+                    ts_feats["bdf_label"] = bdf_label
+                    ecg_timeseries_list.append(ts_feats)
 
             if ecg_features_list:
                 ecg_features = pd.concat(ecg_features_list, ignore_index=True)
+            if ecg_timeseries_list:
+                ecg_timeseries = pd.concat(ecg_timeseries_list, ignore_index=True)
 
             # ── Synchronise ECG + telemetry ───────────────────────────────
             telemetry_df = sync_ecg_with_telemetry(ecg_features, telemetry_df)
 
+            # ── Breathing-rate validation (ECG-derived vs Vyntus) ─────────
+            breathing_rate_metrics, _ = evaluate_breathing_rate_validation(
+                telemetry_df=telemetry_df,
+                ecg_timeseries=ecg_timeseries,
+                patient_id=patient_id,
+                output_dir=patient_out,
+                alignment_tolerance_s=20.0,
+            )
+        else:
+            logger.info(
+                "%s: ECG processing skipped, breathing-rate validation not evaluated.",
+                patient_id,
+            )
+            breathing_rate_metrics, _ = evaluate_breathing_rate_validation(
+                telemetry_df=telemetry_df,
+                ecg_timeseries=pd.DataFrame(),
+                patient_id=patient_id,
+                output_dir=patient_out,
+                alignment_tolerance_s=20.0,
+            )
+            breathing_rate_metrics["breathing_rate_validation_status"] = "skipped_ecg"
+
         # ── Save cleaned CSV ──────────────────────────────────────────────
         save_telemetry_csv(telemetry_df, patient_id, patient_out)
+
+        tasks_summary_metrics: Dict[str, Any] = {
+            "analysis_telemetry_present": True,
+            "analysis_ecg_file_present": ecg_file_present,
+            "analysis_ecg_processed": (not ecg_features.empty or not ecg_timeseries.empty),
+            "analysis_ecg_skipped": bool(skip_ecg),
+            "tasks_log_found": tasks_log_path is not None,
+            "tasks_log_file": str(tasks_log_path) if tasks_log_path is not None else "",
+            "tasks_markers_output_csv": str(marker_output_path) if marker_output_path is not None else "",
+            "tasks_markers_parsed": marker_rows_parsed,
+            "tasks_markers_timestamped": marker_rows_timestamped,
+            "tasks_start_marker_found": marker_start_found,
+            "tasks_start_marker_seconds": marker_start_seconds
+            if marker_start_seconds is not None else np.nan,
+        }
 
         # ── Build summary row ─────────────────────────────────────────────
         summary_row = build_patient_summary(
@@ -1051,6 +2337,9 @@ def process_patient(
             info_df,
             telemetry_df,
             ecg_features if not ecg_features.empty else None,
+            ecg_timeseries=ecg_timeseries if not ecg_timeseries.empty else None,
+            breathing_rate_metrics=breathing_rate_metrics,
+            tasks_metrics=tasks_summary_metrics,
         )
 
         logger.info("  %s — done.", patient_id)
@@ -1058,6 +2347,7 @@ def process_patient(
             "patient_id": patient_id,
             "summary_row": summary_row,
             "telemetry_df": telemetry_df,
+            "tasks_markers_df": tasks_markers_df,
         }
 
     except Exception as exc:
@@ -1903,6 +3193,44 @@ def elbow_plot(
 # ---------------------------------------------------------------------------
 
 
+def save_tasks_markers_csv(
+    markers_df: pd.DataFrame,
+    patient_id: str,
+    output_dir: Path,
+) -> Optional[Path]:
+    """Save parsed ``tasks.log`` markers for one patient.
+
+    Parameters
+    ----------
+    markers_df : pd.DataFrame
+        Parsed marker DataFrame from :func:`parse_tasks_log`.
+    patient_id : str
+        Patient identifier used to construct output filename.
+    output_dir : Path
+        Target directory (created if missing).
+
+    Returns
+    -------
+    Optional[Path]
+        Path to the written CSV, or ``None`` when there are no marker rows.
+    """
+    if markers_df.empty:
+        logger.warning(
+            "%s: no parsed tasks markers available; writing empty marker CSV for visibility.",
+            patient_id,
+        )
+
+    canonical_patient_id = canonicalize_patient_id(patient_id) or patient_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / f"{canonical_patient_id}_tasks_markers.csv"
+    if markers_df.empty:
+        pd.DataFrame(columns=_TASKS_MARKER_COLUMNS).to_csv(out_path, index=False)
+    else:
+        markers_df.to_csv(out_path, index=False)
+    logger.info("Saved tasks marker CSV: %s", out_path)
+    return out_path
+
+
 def save_telemetry_csv(
     telemetry_df: pd.DataFrame,
     patient_id: str,
@@ -1924,8 +3252,9 @@ def save_telemetry_csv(
     Path
         Path to the saved CSV file.
     """
+    canonical_patient_id = canonicalize_patient_id(patient_id) or patient_id
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / f"{patient_id}_telemetry.csv"
+    out_path = output_dir / f"{canonical_patient_id}_telemetry.csv"
     telemetry_df.to_csv(out_path, index=False)
     logger.info("Saved telemetry CSV: %s", out_path)
     return out_path
@@ -1936,6 +3265,9 @@ def build_patient_summary(
     info_df: pd.DataFrame,
     telemetry_df: pd.DataFrame,
     ecg_features: Optional[pd.DataFrame] = None,
+    ecg_timeseries: Optional[pd.DataFrame] = None,
+    breathing_rate_metrics: Optional[Dict[str, Any]] = None,
+    tasks_metrics: Optional[Dict[str, Any]] = None,
 ) -> Dict:
     """Compile a single-row summary dict for one patient.
 
@@ -1949,13 +3281,23 @@ def build_patient_summary(
         Cleaned telemetry DataFrame.
     ecg_features : Optional[pd.DataFrame]
         ECG summary features (optional).
+    ecg_timeseries : Optional[pd.DataFrame]
+        ECG time-series feature table (optional), typically containing
+        ``hr_bpm``, ``rmssd_ms``, ``sdnn_ms`` and ``breathing_rate_bpm``.
+    breathing_rate_metrics : Optional[Dict[str, Any]]
+        Validation metrics comparing ECG-derived breathing rate against
+        measured Vyntus breathing rate (optional).
+    tasks_metrics : Optional[Dict[str, Any]]
+        Parsed tasks.log / marker-alignment metrics for the patient
+        (optional).
 
     Returns
     -------
     Dict
         Flat dictionary suitable for appending to a master summary DataFrame.
     """
-    row: Dict = {"patient_id": patient_id}
+    canonical_patient_id = canonicalize_patient_id(patient_id) or patient_id
+    row: Dict = {"patient_id": canonical_patient_id}
 
     # --- Patient info (first row) ---
     if not info_df.empty:
@@ -1971,12 +3313,230 @@ def build_patient_summary(
         row[f"peak_{col}"] = telemetry_df[col].max()
         row[f"mean_{col}"] = telemetry_df[col].mean()
 
+    # --- Explicit canonical metrics for cross-patient reporting ---
+    hr_col = _find_column(telemetry_df, ["HR", "hr", "Heart Rate"])
+    if hr_col is not None:
+        hr_values = pd.to_numeric(
+            telemetry_df[hr_col].astype(str).str.replace(",", ".", regex=False),
+            errors="coerce",
+        )
+        row["mean_hr_bpm"] = float(hr_values.mean())
+    else:
+        row["mean_hr_bpm"] = float("nan")
+
+    vyntus_br_col = _find_column(telemetry_df, VYNTUS_BREATHING_RATE_CANDIDATES)
+    if vyntus_br_col is not None:
+        br_values = pd.to_numeric(
+            telemetry_df[vyntus_br_col].astype(str).str.replace(",", ".", regex=False),
+            errors="coerce",
+        )
+        row["mean_breathing_rate_bpm_cpet"] = float(br_values.mean())
+    else:
+        row["mean_breathing_rate_bpm_cpet"] = float("nan")
+
     # --- ECG summary ---
     if ecg_features is not None and not ecg_features.empty:
         row["ecg_mean_abs_uV"] = ecg_features["mean_abs_uV"].mean()
         row["ecg_estimated_hr_bpm"] = ecg_features["estimated_hr_bpm"].mean()
 
+    if ecg_timeseries is not None and not ecg_timeseries.empty:
+        metric_map = [
+            ("hr_bpm", "mean_ecg_hr_bpm"),
+            ("rmssd_ms", "mean_rmssd_ms"),
+            ("sdnn_ms", "mean_sdnn_ms"),
+            ("breathing_rate_bpm", "mean_breathing_rate_bpm_edr"),
+        ]
+        for source_col, out_col in metric_map:
+            if source_col not in ecg_timeseries.columns:
+                continue
+            values = pd.to_numeric(ecg_timeseries[source_col], errors="coerce")
+            row[out_col] = float(values.mean())
+
+        if np.isnan(row.get("mean_hr_bpm", float("nan"))):
+            row["mean_hr_bpm"] = row.get("mean_ecg_hr_bpm", float("nan"))
+
+    # --- Breathing-rate validation summary ---
+    if breathing_rate_metrics:
+        for key, value in breathing_rate_metrics.items():
+            row[key] = value
+        calculated_mean = pd.to_numeric(
+            pd.Series([breathing_rate_metrics.get("breathing_rate_mean_calculated_bpm")]),
+            errors="coerce",
+        ).iloc[0]
+        measured_mean = pd.to_numeric(
+            pd.Series([breathing_rate_metrics.get("breathing_rate_mean_measured_bpm")]),
+            errors="coerce",
+        ).iloc[0]
+        if pd.notna(calculated_mean):
+            row["mean_breathing_rate_bpm_edr"] = float(calculated_mean)
+        if pd.notna(measured_mean):
+            row["mean_breathing_rate_bpm_cpet"] = float(measured_mean)
+
+    # --- tasks.log marker summary ---
+    if tasks_metrics:
+        for key, value in tasks_metrics.items():
+            row[key] = value
+
     return row
+
+
+def build_patient_analysis_status_table(summary_df: pd.DataFrame) -> pd.DataFrame:
+    """Build a cross-patient analysis-status table with key summary metrics.
+
+    Parameters
+    ----------
+    summary_df : pd.DataFrame
+        Master summary DataFrame (typically ``master_summary.csv`` content).
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per patient with analysis-run flags and standardized columns:
+        ``mean_hr_bpm``, ``mean_rmssd_ms``, ``mean_sdnn_ms``,
+        ``mean_breathing_rate_bpm_edr``, ``mean_breathing_rate_bpm_cpet``,
+        ``breathing_rate_mae_bpm``.
+
+    Notes
+    -----
+    External requests that mention "SSDM" are mapped to repository HRV naming
+    by using ``mean_rmssd_ms`` as the primary metric. ``mean_sdnn_ms`` is
+    also included explicitly as a companion HRV statistic.
+    """
+    status_columns = [
+        "patient_id",
+        "analysis_telemetry_present",
+        "analysis_ecg_file_present",
+        "analysis_ecg_processed",
+        "analysis_ecg_skipped",
+        "analysis_tasks_log_found",
+        "analysis_tasks_markers_parsed",
+        "analysis_tasks_start_marker_found",
+        "analysis_breathing_validation_status",
+        "analysis_breathing_validation_ok",
+        "mean_hr_bpm",
+        "mean_rmssd_ms",
+        "mean_sdnn_ms",
+        "mean_breathing_rate_bpm_edr",
+        "mean_breathing_rate_bpm_cpet",
+        "breathing_rate_mae_bpm",
+    ]
+    if summary_df.empty:
+        return pd.DataFrame(columns=status_columns)
+
+    patient_col = _find_column(summary_df, ["patient_id"])
+    if patient_col is None:
+        raise ValueError("summary_df must contain a 'patient_id' column.")
+
+    def _pick_numeric(candidates: List[str]) -> pd.Series:
+        out = pd.Series(np.nan, index=summary_df.index, dtype=float)
+        used_columns = set()
+        for candidate in candidates:
+            column = _find_column(summary_df, [candidate])
+            if column is None or column in used_columns:
+                continue
+            used_columns.add(column)
+            series = summary_df[column]
+            if pd.api.types.is_object_dtype(series):
+                series = series.astype(str).str.replace(",", ".", regex=False)
+            parsed = pd.to_numeric(series, errors="coerce")
+            out = out.where(out.notna(), parsed)
+        return out
+
+    def _pick_bool(candidates: List[str], default: bool = False) -> pd.Series:
+        column = _find_column(summary_df, candidates)
+        if column is None:
+            return pd.Series(default, index=summary_df.index, dtype=bool)
+
+        series = summary_df[column]
+        if pd.api.types.is_bool_dtype(series):
+            return series.fillna(default).astype(bool)
+        if pd.api.types.is_numeric_dtype(series):
+            return series.fillna(0).astype(float) != 0.0
+
+        true_tokens = {"1", "true", "yes", "y", "ok"}
+        false_tokens = {"0", "false", "no", "n", "nan", "none", ""}
+        normalized = series.astype(str).str.strip().str.lower()
+        mapped = normalized.map(
+            lambda value: (
+                True
+                if value in true_tokens
+                else False if value in false_tokens else default
+            )
+        )
+        return mapped.astype(bool)
+
+    mean_hr_bpm = _pick_numeric(["mean_hr_bpm", "mean_HR", "mean_hr", "ecg_estimated_hr_bpm"])
+    mean_rmssd_ms = _pick_numeric(["mean_rmssd_ms"])
+    mean_sdnn_ms = _pick_numeric(["mean_sdnn_ms"])
+    mean_breathing_rate_bpm_edr = _pick_numeric(
+        [
+            "mean_breathing_rate_bpm_edr",
+            "breathing_rate_mean_calculated_bpm",
+            "mean_breathing_bpm",
+        ]
+    )
+    mean_breathing_rate_bpm_cpet = _pick_numeric(
+        [
+            "mean_breathing_rate_bpm_cpet",
+            "breathing_rate_mean_measured_bpm",
+            "mean_BF",
+            "mean_bf",
+            "mean_RR",
+            "mean_rr",
+        ]
+    )
+    breathing_rate_mae_bpm = _pick_numeric(["breathing_rate_mae_bpm"])
+    tasks_markers_parsed_count = _pick_numeric(["tasks_markers_parsed"]).fillna(0.0)
+
+    validation_status_col = _find_column(summary_df, ["breathing_rate_validation_status"])
+    if validation_status_col is None:
+        validation_status = pd.Series("not_evaluated", index=summary_df.index, dtype=object)
+    else:
+        validation_status = (
+            summary_df[validation_status_col].fillna("not_evaluated").astype(str)
+        )
+
+    table = pd.DataFrame(index=summary_df.index)
+    raw_patient_ids = summary_df[patient_col].astype(str)
+    table["patient_id"] = raw_patient_ids.apply(
+        lambda value: canonicalize_patient_id(value) or value
+    )
+    table["analysis_telemetry_present"] = _pick_bool(
+        ["analysis_telemetry_present"], default=True
+    )
+    table["analysis_ecg_file_present"] = _pick_bool(
+        ["analysis_ecg_file_present"], default=False
+    )
+    table["analysis_ecg_processed"] = (
+        _pick_bool(["analysis_ecg_processed"], default=False)
+        | mean_rmssd_ms.notna()
+        | mean_sdnn_ms.notna()
+        | _pick_numeric(["ecg_mean_abs_uV"]).notna()
+    )
+    table["analysis_ecg_skipped"] = _pick_bool(["analysis_ecg_skipped"], default=False)
+    table["analysis_tasks_log_found"] = _pick_bool(["tasks_log_found"], default=False)
+    table["analysis_tasks_markers_parsed"] = tasks_markers_parsed_count > 0.0
+    table["analysis_tasks_start_marker_found"] = _pick_bool(
+        ["tasks_start_marker_found"], default=False
+    )
+    table["analysis_breathing_validation_status"] = validation_status
+    table["analysis_breathing_validation_ok"] = (
+        validation_status.str.lower() == "ok"
+    )
+    table["mean_hr_bpm"] = mean_hr_bpm
+    table["mean_rmssd_ms"] = mean_rmssd_ms
+    table["mean_sdnn_ms"] = mean_sdnn_ms
+    table["mean_breathing_rate_bpm_edr"] = mean_breathing_rate_bpm_edr
+    table["mean_breathing_rate_bpm_cpet"] = mean_breathing_rate_bpm_cpet
+    table["breathing_rate_mae_bpm"] = breathing_rate_mae_bpm
+
+    table = (
+        table[status_columns]
+        .sort_values("patient_id")
+        .drop_duplicates(subset=["patient_id"], keep="last")
+        .reset_index(drop=True)
+    )
+    return table
 
 
 # ---------------------------------------------------------------------------
@@ -2040,7 +3600,7 @@ def parse_patient_meta(raw_df: pd.DataFrame) -> Dict:
             return ""
 
     # Row 0 (file row 1): Identificatie / Naam / Voornaam
-    meta["patient_id"] = _cell(0, 1) or None
+    meta["patient_id"] = canonicalize_patient_id(_cell(0, 1)) or None
 
     # Row 1 (file row 2): Bezoekdatum / Geboortedatum / Leeftijd
     meta["visit_date"] = _cell(1, 1) or None

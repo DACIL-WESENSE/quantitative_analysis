@@ -15,8 +15,9 @@ a COPD exacerbation risk score for each patient.
 4. [Step-by-step usage](#step-by-step-usage)
    - [Convert XLS files to CSV](#1-convert-xls-files-to-csv)
    - [Convert BDF files to CSV/TSV](#2-convert-bdf-files-to-csvtsv)
-   - [Run the main analysis pipeline](#3-run-the-main-analysis-pipeline)
-   - [Run the COPD risk scoring notebook](#4-run-the-copd-risk-scoring-notebook)
+   - [Run the main analysis pipeline (Python script)](#3-run-the-main-analysis-pipeline-python-script)
+   - [Run the ECG analysis script (optional)](#4-run-the-ecg-analysis-script-optional)
+   - [Run the COPD risk scoring notebook](#5-run-the-copd-risk-scoring-notebook)
 5. [Configuration reference](#configuration-reference)
 6. [Output reference](#output-reference)
 7. [COPD risk scoring](#copd-risk-scoring)
@@ -39,8 +40,8 @@ pip install -r requirements.txt
 python -m ipykernel install --user --name quantitative_analysis --display-name "quantitative_analysis"
 ```
 
-Then open `main.ipynb` or `copd_risk.ipynb` and select the
-`quantitative_analysis` kernel.
+Notebook execution remains available, but the primary entrypoints are now
+regular Python scripts (`run_pipeline.py` and `run_ecg.py`).
 
 ---
 
@@ -48,9 +49,10 @@ Then open `main.ipynb` or `copd_risk.ipynb` and select the
 
 ### Folder structure
 
-Place one sub-folder per patient/trial inside `./data`.  The folder name
-becomes the patient identifier used throughout the pipeline and in all output
-filenames.
+Place one sub-folder per patient/trial inside `./data`. Nested patient folders
+are supported; discovery is recursive and deterministic. A canonical patient ID
+is resolved per dataset (metadata-first, with filename/folder fallback) and is
+used consistently in outputs.
 
 ```
 data/
@@ -106,9 +108,10 @@ the next annotation:
 The pipeline tolerates missing stages — if `VT1` or `VT2` rows are absent the
 corresponding features will be `NaN` or flagged accordingly.
 
-**Per-patient, the pipeline picks the first `.csv` file it finds in the
-folder.**  If a folder contains multiple CSV files, rename or remove the ones
-you do not want processed.
+**Per-patient, the pipeline recursively searches for telemetry `.csv` files and
+selects one deterministically** (preferring files that match the expected
+WESENSE telemetry header pattern). If a folder contains multiple telemetry
+exports, keep only the intended file.
 
 ### BDF ECG files (optional)
 
@@ -135,11 +138,11 @@ conda activate quantitative_analysis
 # 3. Convert raw .xls exports to CSV
 python xls_to_csv.py
 
-# 4. Open the main pipeline and run all cells
-jupyter notebook cpet.ipynb
+# 4. Run the CPET pipeline (no notebook required)
+python run_pipeline.py --data-root data --output-root output
 
-# 5. (Optional) Run the COPD risk scoring notebook
-jupyter notebook copd_risk.ipynb
+# 5. (Optional) Run ECG deep-dive for one patient
+python run_ecg.py --data-root data --output-root output
 ```
 
 Results are written to `./output/`.
@@ -150,8 +153,8 @@ Results are written to `./output/`.
 
 ### 1. Convert XLS files to CSV
 
-The WESENSE device exports tab-separated `.xls` files.  Convert them before
-running either notebook:
+The WESENSE device exports tab-separated `.xls` files. Convert them before
+running the analysis scripts:
 
 ```bash
 # Convert all .xls files under ./data (skips files that already have a .csv)
@@ -212,35 +215,62 @@ Each output file has one row per sample and the following columns:
 The output file is placed alongside the source `.bdf` unless `--output-dir`
 is specified.
 
-### 3. Run the main analysis pipeline
+### 3. Run the main analysis pipeline (Python script)
 
-Open `main.ipynb` in Jupyter and **edit the configuration cell** near the top:
+```bash
+# Basic run (telemetry-focused; ECG extraction skipped)
+python run_pipeline.py --data-root data --output-root output
 
-```python
-DATA_ROOT  = "data"    # path to the folder containing patient sub-folders
-OUTPUT_ROOT = "output" # all generated files go here
+# Include ECG features from BDF files (if available)
+python run_pipeline.py --data-root data --output-root output --include-ecg
+
+# Parallel patient processing and custom workers
+python run_pipeline.py --data-root data --output-root output --parallel --workers 8
 ```
 
-Then **Run All** (`Kernel → Restart & Run All`).
-
-The pipeline runs the following steps for every patient folder:
+The script runs the following steps for every patient folder:
 
 | Step           | What it does                                                               |
 |----------------|----------------------------------------------------------------------------|
 | Load telemetry | Reads the CSV, parses stage annotations, returns a cleaned DataFrame       |
-| Load ECG       | Reads L1 / L2 BDF files with MNE; extracts mean amplitude and estimated HR |
+| Parse tasks.log | If present, parses timestamped task markers and exports per-patient marker CSV |
+| Load ECG       | Optional (`--include-ecg`): reads L1 / L2 BDF files with MNE; trims pre-start data before marker `start,Start on Vyntus CPX` when available |
 | Sync           | Merges ECG features into the telemetry DataFrame                           |
+| Validate BR    | Compares ECG-derived breathing rate with measured Vyntus BF/RR (time-aligned metrics) |
 | Save           | Writes `<patient_id>_telemetry.csv` to `output/<patient_id>/`              |
 | Summarise      | Appends a row to the master summary                                        |
 
-After batch processing, the notebook produces EDA plots (stage profiles,
+After batch processing, the script produces EDA plots (stage profiles,
 V-slope, RER trajectory, HRR), a cross-patient correlation heatmap, and
 unsupervised ML analysis (PCA, K-Means, DBSCAN).
+
+It also writes a cross-patient status table (`patient_analysis_status.csv`)
+with canonical patient IDs, analysis-run flags, and key metrics:
+`mean_hr_bpm`, `mean_rmssd_ms` (SSDM request mapped to RMSSD naming),
+`mean_sdnn_ms`, `mean_breathing_rate_bpm_edr`,
+`mean_breathing_rate_bpm_cpet`, and `breathing_rate_mae_bpm`.
 
 Progress bars show throughput for each batch step.  Failed patients are
 logged to `pipeline.log` and skipped — they do not interrupt the pipeline.
 
-### 4. Run the COPD risk scoring notebook
+### 4. Run the ECG analysis script (optional)
+
+```bash
+# Single-patient ECG analysis (defaults to first patient folder)
+python run_ecg.py --data-root data --output-root output
+
+# Explicit patient + custom ECG window length
+python run_ecg.py --data-root data --output-root output \
+  --patient-id "Patient 1" --window-duration 30
+
+# Also compute a cross-patient ECG batch summary
+python run_ecg.py --data-root data --output-root output --run-batch-summary
+```
+
+This script reuses the ECG helpers in `functions.py` and writes outputs under
+`output/ecg_analysis/<patient_id>/`.
+
+### 5. Run the COPD risk scoring notebook
 
 Open `copd_risk.ipynb` and set the same two path variables:
 
@@ -259,6 +289,36 @@ Then **Run All**.  For each patient it:
 ---
 
 ## Configuration reference
+
+### `run_pipeline.py` (primary CPET entrypoint)
+
+| Flag                  | Default   | Description |
+|-----------------------|-----------|-------------|
+| `--data-root`         | `data`    | Root directory containing patient sub-folders |
+| `--output-root`       | `output`  | Base output directory |
+| `--include-ecg`       | off       | Include ECG extraction/sync during per-patient processing |
+| `--parallel`          | off       | Process patient folders concurrently |
+| `--workers`           | `4`       | Worker threads when `--parallel` is set |
+| `--skip-ml`           | off       | Skip pooled PCA / clustering section |
+| `--kmeans-clusters`   | `4`       | Number of K-Means clusters |
+| `--dbscan-eps`        | `1.0`     | DBSCAN neighbourhood radius |
+| `--dbscan-min-samples`| `5`       | DBSCAN minimum neighbourhood size |
+| `--use-gpu`           | off       | Enable optional CuPy acceleration |
+| `--log-file`          | `<output-root>/pipeline.log` | Override log file path |
+| `--log-level`         | `INFO`    | Logging verbosity |
+
+### `run_ecg.py` (primary ECG entrypoint)
+
+| Flag                | Default   | Description |
+|---------------------|-----------|-------------|
+| `--data-root`       | `data`    | Root directory containing patient sub-folders |
+| `--output-root`     | `output`  | Base output directory |
+| `--patient-id`      | first patient folder | Target patient folder name |
+| `--window-duration` | `30`      | Sliding window duration (seconds) |
+| `--preview-seconds` | `300`     | Seconds shown in raw ECG preview plot |
+| `--run-batch-summary` | off     | Build batch-level ECG summary CSV + figure |
+| `--log-file`        | `<output-root>/pipeline.log` | Override log file path |
+| `--log-level`       | `INFO`    | Logging verbosity |
 
 ### `main.ipynb`
 
@@ -309,7 +369,8 @@ To change the clinical thresholds used for risk flagging, edit the
 ```
 output/
 ├── pipeline.log                        ← combined log from all notebook runs
-├── master_summary.csv                  ← one row per patient, all peak/mean metrics
+├── master_summary.csv                  ← one row per patient, peak/mean metrics + breathing-rate validation metrics
+├── patient_analysis_status.csv         ← cross-patient analysis flags + key metrics (HR/RMSSD/SDNN/breathing + MAE)
 ├── batch_vo2_by_gender.png             ← box plot: VO2 distribution by sex
 ├── batch_bmi_vs_vo2.png                ← scatter: BMI vs peak VO2
 ├── scree.png                           ← PCA explained variance
@@ -320,6 +381,8 @@ output/
 │
 ├── <patient_id>/                       ← one sub-folder per patient
 │   ├── <patient_id>_telemetry.csv      ← cleaned telemetry with Stage column
+│   ├── <patient_id>_tasks_markers.csv  ← parsed tasks.log markers with timestamps
+│   ├── <patient_id>_breathing_rate_validation.csv  ← aligned ECG-vs-Vyntus breathing-rate samples
 │   └── <patient_id>_metrics_by_stage.png
 │
 ├── copd_risk_summary.csv               ← one row per patient: markers + flags + risk score
@@ -329,7 +392,11 @@ output/
     └── all_patients_pca_2d_risk.png    ← PCA scatter coloured by risk level (≥3 patients)
 ```
 
-`pipeline.log` uses ISO 8601 timestamps and is appended on every run.  To
+`patient_analysis_status.csv` uses explicit, stable column names. For HRV,
+the requested "SSDM" metric is represented as `mean_rmssd_ms` (primary), and
+`mean_sdnn_ms` is also included to make the RMSSD/SDNN mapping explicit.
+
+`pipeline.log` uses ISO 8601 timestamps and is appended on every script/notebook run. To
 start a fresh log, delete the file before running.
 
 ---
