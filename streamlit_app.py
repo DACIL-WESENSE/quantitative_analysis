@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 st.set_page_config(
     page_title="DACIL-WESENSE Analysis Pipeline",
-    page_icon="📊",
+    page_icon="",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -265,7 +265,7 @@ def main():
     """Main Streamlit application."""
     # Sidebar configuration
     with st.sidebar:
-        st.title("⚙️ Configuration")
+        st.title("️ Configuration")
 
         # Data paths
         st.session_state.data_root = st.text_input(
@@ -299,20 +299,20 @@ def main():
         st.divider()
 
         # Refresh button
-        if st.button("🔄 Refresh All Data"):
+        if st.button(" Refresh All Data"):
             st.session_state.last_refresh = datetime.now()
             st.rerun()
 
     # Main content area with tabs
     tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
         [
-            "📊 Dashboard",
-            "🔄 Data Flow",
-            "📁 Task Explorer",
-            "⚙️ Processing",
-            "📈 Results",
-            "⚙️ Config Panel",
-            "📋 Logs",
+            " Dashboard",
+            " Data Flow",
+            " Task Explorer",
+            "️ Processing",
+            " Results",
+            "️ Config Panel",
+            " Logs",
         ]
     )
 
@@ -320,7 +320,7 @@ def main():
     # Tab 1: Dashboard Overview
     # ========================================================================
     with tab1:
-        st.title("📊 Dashboard Overview")
+        st.title(" Dashboard Overview")
 
         status = get_pipeline_status()
 
@@ -329,28 +329,28 @@ def main():
 
         with col1:
             st.metric(
-                "👥 Patients",
+                " Patients",
                 status["patient_count"],
                 help="Total patient folders discovered",
             )
 
         with col2:
             st.metric(
-                "📊 Telemetry Files",
+                " Telemetry Files",
                 status["csv_count"],
                 help="CSV telemetry files found",
             )
 
         with col3:
             st.metric(
-                "📈 ECG Files",
+                " ECG Files",
                 status["bdf_count"],
                 help="BDF ECG files found",
             )
 
         with col4:
             st.metric(
-                "✅ Processed",
+                " Processed",
                 status["processed_count"],
                 help="Patients with completed analysis",
             )
@@ -361,11 +361,11 @@ def main():
         col1, col2, col3 = st.columns(3)
 
         with col1:
-            data_root_status = "✅ Exists" if status["data_root_exists"] else "❌ Missing"
+            data_root_status = " Exists" if status["data_root_exists"] else " Missing"
             st.write(f"**Data Root**: {data_root_status}")
 
         with col2:
-            output_root_status = "✅ Exists" if status["output_root_exists"] else "❌ Missing"
+            output_root_status = " Exists" if status["output_root_exists"] else " Missing"
             st.write(f"**Output Root**: {output_root_status}")
 
         with col3:
@@ -385,7 +385,7 @@ def main():
     # Tab 2: Data Flow Visualization
     # ========================================================================
     with tab2:
-        st.title("🔄 Data Flow Visualization")
+        st.title(" Data Flow Visualization")
         st.write("Interactive pipeline architecture diagram showing data flow through stages.")
 
         fig = create_pipeline_diagram()
@@ -395,11 +395,11 @@ def main():
 
         st.subheader("Pipeline Stages")
         stages_info = {
-            "📥 Data Loading": "Discover patient folders, load telemetry CSV and ECG BDF files.",
-            "🧹 Preprocessing": "Parse metadata, normalize column names, align timestamps.",
-            "🔬 ECG Processing": "Extract ECG features, compute HRV metrics, breathing rate estimation.",
-            "🔗 Alignment": "Synchronize ECG with telemetry data, validate breathing rates.",
-            "📊 Output Generation": "Export cleaned telemetry, compute stage summaries, generate plots.",
+            " Data Loading": "Discover patient folders, load telemetry CSV and ECG BDF files.",
+            " Preprocessing": "Parse metadata, normalize column names, align timestamps.",
+            " ECG Processing": "Extract ECG features, compute HRV metrics, breathing rate estimation.",
+            " Alignment": "Synchronize ECG with telemetry data, validate breathing rates.",
+            " Output Generation": "Export cleaned telemetry, compute stage summaries, generate plots.",
         }
 
         for stage, description in stages_info.items():
@@ -410,7 +410,7 @@ def main():
     # Tab 3: Task/Stage Explorer
     # ========================================================================
     with tab3:
-        st.title("📁 Task/Stage Explorer")
+        st.title(" Task/Stage Explorer")
 
         data_root = Path(st.session_state.data_root)
 
@@ -437,32 +437,32 @@ def main():
         col1, col2 = st.columns(2)
 
         with col1:
-            st.subheader("📁 Files Found")
+            st.subheader(" Files Found")
             st.write(f"**Folder**: {details['folder_name']}")
 
             if details["csv_file"]:
-                st.success(f"✅ Telemetry: {details['csv_file'].name}")
+                st.success(f" Telemetry: {details['csv_file'].name}")
                 st.caption(f"Rows: {details['csv_rows']}")
             else:
-                st.error("❌ No telemetry CSV found")
+                st.error(" No telemetry CSV found")
 
             if details["bdf_l1"]:
-                st.success(f"✅ ECG L1: {details['bdf_l1'].name}")
+                st.success(f" ECG L1: {details['bdf_l1'].name}")
             if details["bdf_l2"]:
-                st.success(f"✅ ECG L2: {details['bdf_l2'].name}")
+                st.success(f" ECG L2: {details['bdf_l2'].name}")
             if not details["bdf_l1"] and not details["bdf_l2"]:
                 st.info("ℹ️ No ECG files found")
 
             if details["tasks_log"]:
-                st.success(f"✅ Tasks Log: {details['tasks_log'].name}")
+                st.success(f" Tasks Log: {details['tasks_log'].name}")
             else:
                 st.info("ℹ️ No tasks.log found")
 
         with col2:
-            st.subheader("📊 Processing Status")
+            st.subheader(" Processing Status")
 
             if details["processed"]:
-                st.success("✅ **Processed** - Output files generated")
+                st.success(" **Processed** - Output files generated")
             else:
                 st.warning("⏳ **Pending** - Not yet processed")
 
@@ -488,7 +488,7 @@ def main():
     # Tab 4: Processing Control
     # ========================================================================
     with tab4:
-        st.title("⚙️ Processing Control")
+        st.title("️ Processing Control")
 
         data_root = Path(st.session_state.data_root)
 
@@ -509,11 +509,11 @@ def main():
         # Select all / deselect all buttons
         col1, col2, col3 = st.columns([1, 1, 2])
         with col1:
-            if st.button("✅ Select All"):
+            if st.button(" Select All"):
                 st.session_state.selected_patients = patient_names
                 st.rerun()
         with col2:
-            if st.button("❌ Clear All"):
+            if st.button(" Clear All"):
                 st.session_state.selected_patients = []
                 st.rerun()
 
@@ -534,13 +534,13 @@ def main():
         with col1:
             st.write("**Include ECG Processing**")
             st.info(
-                f"ECG: {'Enabled ✅' if st.session_state.pipeline_config['include_ecg'] else 'Disabled ❌'}"
+                f"ECG: {'Enabled ' if st.session_state.pipeline_config['include_ecg'] else 'Disabled '}"
             )
 
         with col2:
             st.write("**Parallel Processing**")
             st.info(
-                f"Parallel: {'Enabled ✅' if st.session_state.pipeline_config['parallel_processing'] else 'Disabled ❌'}"
+                f"Parallel: {'Enabled ' if st.session_state.pipeline_config['parallel_processing'] else 'Disabled '}"
             )
             if st.session_state.pipeline_config["parallel_processing"]:
                 st.caption(f"Workers: {st.session_state.pipeline_config['num_workers']}")
@@ -568,7 +568,7 @@ def main():
             )
 
         with col2:
-            if st.button("▶️ Start Processing", type="primary"):
+            if st.button("️ Start Processing", type="primary"):
                 if not st.session_state.selected_patients:
                     st.error("Please select at least one patient.")
                 else:
@@ -587,7 +587,7 @@ def main():
     # Tab 5: Results Inspector
     # ========================================================================
     with tab5:
-        st.title("📈 Results Inspector")
+        st.title(" Results Inspector")
 
         output_root = Path(st.session_state.output_root)
 
@@ -614,7 +614,7 @@ def main():
         col1, col2 = st.columns([1, 2])
 
         with col1:
-            st.subheader("📊 Available Files")
+            st.subheader(" Available Files")
             if csv_files:
                 st.write(f"Found {len(csv_files)} output files:")
                 for f in csv_files:
@@ -623,7 +623,7 @@ def main():
                 st.info("No output files found for this patient.")
 
         with col2:
-            st.subheader("📈 File Preview")
+            st.subheader(" File Preview")
             if csv_files:
                 selected_file = st.selectbox(
                     "Select File to View",
@@ -652,7 +652,7 @@ def main():
         st.divider()
 
         # Cross-patient summary
-        st.subheader("📋 Cross-Patient Summary")
+        st.subheader(" Cross-Patient Summary")
 
         try:
             summary_rows = []
@@ -683,7 +683,7 @@ def main():
     # Tab 6: Configuration Panel
     # ========================================================================
     with tab6:
-        st.title("⚙️ Configuration Panel")
+        st.title("️ Configuration Panel")
 
         st.subheader("Pipeline Paths")
 
@@ -692,14 +692,14 @@ def main():
         with col1:
             st.write(f"**Data Root**: `{st.session_state.data_root}`")
             if Path(st.session_state.data_root).exists():
-                st.success("✅ Directory exists")
+                st.success(" Directory exists")
             else:
-                st.error("❌ Directory not found")
+                st.error(" Directory not found")
 
         with col2:
             st.write(f"**Output Root**: `{st.session_state.output_root}`")
             if Path(st.session_state.output_root).exists():
-                st.success("✅ Directory exists")
+                st.success(" Directory exists")
             else:
                 st.info("ℹ️ Will be created during processing")
 
@@ -746,7 +746,7 @@ def main():
     # Tab 7: Logs Viewer
     # ========================================================================
     with tab7:
-        st.title("📋 Logs Viewer")
+        st.title(" Logs Viewer")
 
         log_file = Path("pipeline.log")
 
@@ -754,10 +754,10 @@ def main():
             st.info("No pipeline.log file found yet.")
             col1, col2 = st.columns(2)
             with col1:
-                if st.button("📝 Create Sample Log"):
+                if st.button(" Create Sample Log"):
                     st.info("Log file will be created during pipeline execution.")
         else:
-            st.success("✅ pipeline.log found")
+            st.success(" pipeline.log found")
 
             # Log controls
             col1, col2 = st.columns([1, 1])
@@ -766,7 +766,7 @@ def main():
                 num_lines = st.slider("Lines to Display", 10, 1000, 100)
 
             with col2:
-                if st.button("🔄 Refresh Logs"):
+                if st.button(" Refresh Logs"):
                     st.rerun()
 
             st.divider()
@@ -782,7 +782,7 @@ def main():
             # Search logs
             st.divider()
 
-            search_term = st.text_input("🔍 Search logs", help="Find specific text in logs")
+            search_term = st.text_input(" Search logs", help="Find specific text in logs")
 
             if search_term:
                 log_lines = log_content.split("\n")
@@ -796,7 +796,7 @@ def main():
 
             # Log file info
             st.divider()
-            st.subheader("📊 Log File Info")
+            st.subheader(" Log File Info")
 
             file_stat = log_file.stat()
             col1, col2, col3 = st.columns(3)
@@ -840,8 +840,8 @@ def main():
     with col3:
         st.caption(
             """
-            📖 [README](README.md) | 
-            📚 [Documentation](STREAMLIT_USAGE.md)
+             [README](README.md) | 
+             [Documentation](STREAMLIT_USAGE.md)
             """
         )
 
