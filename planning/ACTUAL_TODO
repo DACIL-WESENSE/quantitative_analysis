@@ -1,0 +1,12 @@
+- From all BDF files, exclude any data that happens before the "start,Start on Vyntus CPX" marker on the tasks.log
+- In all patients, add timestamp markers based on the tasks.log file.
+- Use the CPET/ADL data to compare the calculated breathing rate to the measured one by the Vyntus.
+
+- Change folder searching algorithm
+- Convert out of IPYNB, go back to regular PY files. We will use a Streamlit app for presenting that will be developed later.
+- Add a patient ID summary table showing which analyses have been run, and the results from them (mean HR, SSDM, Breathing rate, Breathing rate from CPET, Breathing rate accuracy...)
+- Make sure patient ID stays the same throughout study
+
+- In the wiki folder, start writing a technical documentation of the functions, where they are, and the reasoning behind them. Also give a background on the study, FAIR and GDPR compliance
+
+- Run quality checks of the code (will happen automatically when converting to .py)

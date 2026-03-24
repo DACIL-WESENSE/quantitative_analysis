@@ -1,7 +1,0 @@
-First 10s is not attached to the patient yet, check _tasks.log
-We know for sure all sensors are attached at event start,Start on Vyntus CPX
-Compare ECG data to Vyntus CPX
-
-Fix patient folder loading data
-Write documentation of the code
-Quality checks of the code

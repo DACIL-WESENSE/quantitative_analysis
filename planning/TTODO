@@ -1,6 +1,0 @@
-- Add time marks based on the _tasks.log files. We know for sure all sensors are attached at event start,Start on Vyntus CPX. 
-- Compare ECG breathing data to CPX data (ADL and CPET)
-- Add a Dataframe that links each folder name to the patient ID used within the code
-- Run quality checks of the code
-- Write technical documentation on the codebase, including on each function, where it is located, what it does, and why.
-- Update the Streamlit app
