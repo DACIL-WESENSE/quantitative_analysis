@@ -3,7 +3,7 @@
 ## Overview
 Comprehensive pytest-based integration test suite for the DACIL-WESENSE quantitative analysis pipeline.
 
-**Status**: ✅ **ALL 144 TESTS PASSING**
+**Status**: [PASS] **ALL 144 TESTS PASSING**
 
 ## Test Organization
 
@@ -39,11 +39,11 @@ Tests for directory parsing, file discovery, and patient ID resolution.
   - Recursive search
 
 **Key Test Coverage**:
-- ✅ Precedence rules (metadata > filename > folder)
-- ✅ Natural sort order (Patient1, Patient2, Patient10)
-- ✅ Hidden directory filtering
-- ✅ Case-insensitive file matching
-- ✅ Fallback strategies
+- [PASS] Precedence rules (metadata > filename > folder)
+- [PASS] Natural sort order (Patient1, Patient2, Patient10)
+- [PASS] Hidden directory filtering
+- [PASS] Case-insensitive file matching
+- [PASS] Fallback strategies
 
 ---
 
@@ -76,11 +76,11 @@ Tests for telemetry and ECG data loading.
   - Data preservation
 
 **Key Test Coverage**:
-- ✅ WESENSE CSV format (5-row header + data)
-- ✅ Stage detection & forward-fill
-- ✅ BDF loading & trimming
-- ✅ ECG feature extraction (HR, mean_abs_uV)
-- ✅ Multi-channel ECG processing
+- [PASS] WESENSE CSV format (5-row header + data)
+- [PASS] Stage detection & forward-fill
+- [PASS] BDF loading & trimming
+- [PASS] ECG feature extraction (HR, mean_abs_uV)
+- [PASS] Multi-channel ECG processing
 
 ---
 
@@ -122,11 +122,11 @@ Tests for tasks.log parsing and marker timestamp extraction.
 - `_build_tasks_marker_match_mask()` - 2 tests (internal helper)
 
 **Key Test Coverage**:
-- ✅ Multiple timestamp format support
-- ✅ Multiple delimiter support
-- ✅ Case-insensitive matching
-- ✅ Precedence rules for event/label matching
-- ✅ ECG trimming validation
+- [PASS] Multiple timestamp format support
+- [PASS] Multiple delimiter support
+- [PASS] Case-insensitive matching
+- [PASS] Precedence rules for event/label matching
+- [PASS] ECG trimming validation
 
 ---
 
@@ -169,10 +169,10 @@ Tests for breathing-rate validation and ECG-Vyntus comparison.
   - Missing data handling
 
 **Key Test Coverage**:
-- ✅ Nearest-neighbor alignment with tolerance
-- ✅ All statistical metrics (bias, MAE, RMSE, correlation)
-- ✅ Edge cases (empty data, single sample)
-- ✅ CSV export functionality
+- [PASS] Nearest-neighbor alignment with tolerance
+- [PASS] All statistical metrics (bias, MAE, RMSE, correlation)
+- [PASS] Edge cases (empty data, single sample)
+- [PASS] CSV export functionality
 
 ---
 
@@ -209,11 +209,11 @@ Tests for patient summary generation and cross-patient aggregation.
   - Empty marker handling
 
 **Key Test Coverage**:
-- ✅ Multi-source metric extraction (peak, mean, ECG-derived)
-- ✅ Cross-patient aggregation
-- ✅ Demographic data handling
-- ✅ Duplicate removal
-- ✅ CSV export
+- [PASS] Multi-source metric extraction (peak, mean, ECG-derived)
+- [PASS] Cross-patient aggregation
+- [PASS] Demographic data handling
+- [PASS] Duplicate removal
+- [PASS] CSV export
 
 ---
 
@@ -242,8 +242,8 @@ Tests for patient summary generation and cross-patient aggregation.
 
 ### Summary Statistics
 - **Total Tests**: 144
-- **Passed**: 144 ✅
-- **Failed**: 0 ✅
+- **Passed**: 144 [PASS]
+- **Failed**: 0 [PASS]
 - **Warnings**: 2 (non-critical pandas datetime parsing)
 
 ### Execution Time
@@ -259,25 +259,25 @@ Tests for patient summary generation and cross-patient aggregation.
 ## Happy-Path Tests
 
 All major workflows tested:
-- ✅ Folder discovery → CSV loading → Data parsing
-- ✅ BDF discovery → ECG loading → Feature extraction
-- ✅ Tasks.log parsing → Marker finding → ECG trimming
-- ✅ Breathing-rate alignment → Metrics calculation
-- ✅ Summary generation → Cross-patient aggregation
+- [PASS] Folder discovery → CSV loading → Data parsing
+- [PASS] BDF discovery → ECG loading → Feature extraction
+- [PASS] Tasks.log parsing → Marker finding → ECG trimming
+- [PASS] Breathing-rate alignment → Metrics calculation
+- [PASS] Summary generation → Cross-patient aggregation
 
 ---
 
 ## Edge-Case Tests
 
 Comprehensive edge case coverage:
-- ✅ Empty/missing columns (graceful degradation)
-- ✅ Malformed inputs (invalid timestamps, bad CSV)
-- ✅ Empty data (empty DataFrames, no files found)
-- ✅ Numeric edge cases (NaN, Inf, negative values)
-- ✅ Case sensitivity (mixed case handling)
-- ✅ Multiple format support (timestamps, delimiters)
-- ✅ Recursive directory search (hidden directories skipped)
-- ✅ Natural sort order (numeric vs lexicographic)
+- [PASS] Empty/missing columns (graceful degradation)
+- [PASS] Malformed inputs (invalid timestamps, bad CSV)
+- [PASS] Empty data (empty DataFrames, no files found)
+- [PASS] Numeric edge cases (NaN, Inf, negative values)
+- [PASS] Case sensitivity (mixed case handling)
+- [PASS] Multiple format support (timestamps, delimiters)
+- [PASS] Recursive directory search (hidden directories skipped)
+- [PASS] Natural sort order (numeric vs lexicographic)
 
 ---
 

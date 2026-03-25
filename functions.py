@@ -1006,6 +1006,7 @@ def extract_ecg_features(
 def extract_ecg_timeseries(
     raw: mne.io.BaseRaw,
     window_duration: float = 30.0,
+    show_progress: bool = True,
 ) -> pd.DataFrame:
     """Extract time-resolved ECG features using a sliding window.
 
@@ -1022,6 +1023,8 @@ def extract_ecg_timeseries(
         Duration of each analysis window in seconds (default 30 s).
         Frequency-domain HRV values are exploratory at short windows; the
         clinical standard is ≥ 300 s.
+    show_progress : bool
+        Display tqdm progress bar during channel processing (default True).
 
     Returns
     -------
@@ -1052,7 +1055,12 @@ def extract_ecg_timeseries(
     rows: List[Dict] = []
     nan = float("nan")
 
-    for ch_idx in ecg_picks:
+    for ch_idx in tqdm(
+        ecg_picks,
+        desc="Processing ECG channels",
+        disable=not show_progress,
+        unit="channel",
+    ):
         ch_name = raw.ch_names[ch_idx]
         full_data, _ = raw[ch_idx, :]
         full_signal = full_data.squeeze()
@@ -1114,6 +1122,7 @@ def extract_ecg_timeseries_array(
     sfreq: float,
     channel_names: Optional[List[str]] = None,
     window_duration: float = 30.0,
+    show_progress: bool = True,
 ) -> pd.DataFrame:
     """Extract time-resolved ECG features from a raw NumPy array.
 
@@ -1132,6 +1141,8 @@ def extract_ecg_timeseries_array(
         Labels for each row of *data*.  Defaults to ``["ch0", "ch1", …]``.
     window_duration : float
         Duration of each analysis window in seconds (default 30 s).
+    show_progress : bool
+        Display tqdm progress bar during channel processing (default True).
 
     Returns
     -------
@@ -1151,7 +1162,12 @@ def extract_ecg_timeseries_array(
     rows: List[Dict] = []
     nan = float("nan")
 
-    for ch_idx in range(n_channels):
+    for ch_idx in tqdm(
+        range(n_channels),
+        desc="Processing channels",
+        disable=not show_progress,
+        unit="channel",
+    ):
         ch_name = channel_names[ch_idx]
         full_signal = data[ch_idx].astype(float)
 
@@ -2109,6 +2125,7 @@ def process_patient(
     output_base: Path,
     use_ecg_checkpoint: bool = True,
     skip_ecg: bool = False,
+    show_progress: bool = True,
 ) -> Optional[Dict]:
     """Run the full pipeline for a single patient folder.
 
@@ -2131,6 +2148,8 @@ def process_patient(
         When ``True``, skip all BDF discovery, ECG loading, feature
         extraction, and ECG synchronisation entirely.  The ECG helpers in
         this module remain available for standalone use.
+    show_progress : bool
+        Display tqdm progress bars during ECG processing (default True).
 
     Returns
     -------
@@ -2223,7 +2242,15 @@ def process_patient(
             if marker_start_seconds is not None:
                 marker_cache_key = f"aligned_{marker_start_seconds:.3f}s"
 
-            for bdf_label, bdf_path in [("L1", l1_path), ("L2", l2_path)]:
+            bdf_pairs = [("L1", l1_path), ("L2", l2_path)]
+            bdf_pairs_available = [(lbl, pth) for lbl, pth in bdf_pairs if pth is not None]
+
+            for bdf_label, bdf_path in tqdm(
+                bdf_pairs,
+                desc="Processing ECG sensors",
+                disable=not show_progress,
+                unit="sensor",
+            ):
                 if bdf_path is None:
                     logger.warning("  %s — %s BDF not found.", patient_id, bdf_label)
                     continue
@@ -2266,7 +2293,7 @@ def process_patient(
                         cache_key=marker_cache_key,
                     )
                 if raw is not None and ts_feats is None:
-                    ts_feats = extract_ecg_timeseries(raw)
+                    ts_feats = extract_ecg_timeseries(raw, show_progress=show_progress)
                     save_ecg_timeseries_checkpoint(
                         ts_feats,
                         patient_out,
