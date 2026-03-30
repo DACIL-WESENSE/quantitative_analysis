@@ -1,28 +1,10 @@
 # DACIL-WESENSE Quantitative Analysis
 
-End-to-end pipeline for CPET (cardiopulmonary exercise testing) data collected
-with the WESENSE sensor system.  Given a set of patient folders it produces
-cleaned telemetry CSVs, exploratory plots, unsupervised ML visualisations, and
-a COPD exacerbation risk score for each patient.
-
----
-
 ## Table of contents
 
 1. [Prerequisites](#prerequisites)
 2. [Input data format](#input-data-format)
 3. [Quickstart](#quickstart)
-4. [Step-by-step usage](#step-by-step-usage)
-   - [Convert XLS files to CSV](#1-convert-xls-files-to-csv)
-   - [Convert BDF files to CSV/TSV](#2-convert-bdf-files-to-csvtsv)
-   - [Run the main analysis pipeline (Python script)](#3-run-the-main-analysis-pipeline-python-script)
-   - [Run the ECG analysis script (optional)](#4-run-the-ecg-analysis-script-optional)
-   - [Run the COPD risk scoring notebook](#5-run-the-copd-risk-scoring-notebook)
-5. [Configuration reference](#configuration-reference)
-6. [Output reference](#output-reference)
-7. [COPD risk scoring](#copd-risk-scoring)
-
----
 
 ## Prerequisites
 
@@ -418,18 +400,4 @@ range associated with elevated COPD risk.
 | Peak O₂ pulse            | `VO2/HR`                           | `< threshold`  | 10 mL/beat   | Wasserman 5th ed.               |
 | VT1 presence             | `Stage == "VT1"`                   | absent (= 0)   | —            | —                               |
 
-**Composite score:**
-
-| n\_flags | Risk level |
-|----------|------------|
-| 0        | Low        |
-| 1–2      | Moderate   |
-| ≥ 3      | High       |
-
-To change any threshold, edit `_COPD_THRESHOLDS` in `functions.py`.  The
-baseline SpO₂ is computed as the median of the first 10 data rows
-(resting / warm-up phase).
-
-> **Note:** This scoring is intended as a research screening tool, not a
-> clinical diagnostic.  Thresholds are derived from group-level CPET
-> reference values and should be validated against your specific population.
+GitHub Copilot was used to aid in the development of this codebase. However, at no point in time was the Copilot process able to interact with patient data, nor was it fed patient data. All Copilot outputs were manually checked by a human.

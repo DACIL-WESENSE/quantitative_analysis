@@ -1,0 +1,93 @@
+[ ] Fix the run_entire_pipeline.sh file
+
+[ ] The run_pipeline.py file gives the following error:
+Patient plots:   0%|                                      | 0/1 [00:00<?, ?it/s]
+Traceback (most recent call last):
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/groupby/groupby.py", line 1944, in _agg_py_fallback
+    res_values = self._grouper.agg_series(ser, alt, preserve_dtype=True)
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/groupby/ops.py", line 873, in agg_series
+    result = self._aggregate_series_pure_python(obj, func)
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/groupby/ops.py", line 894, in _aggregate_series_pure_python
+    res = func(group)
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/groupby/groupby.py", line 2461, in <lambda>
+    alt=lambda x: Series(x, copy=False).mean(numeric_only=numeric_only),
+                  ~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/series.py", line 6570, in mean
+    return NDFrame.mean(self, axis, skipna, numeric_only, **kwargs)
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/generic.py", line 12485, in mean
+    return self._stat_function(
+           ~~~~~~~~~~~~~~~~~~~^
+        "mean", nanops.nanmean, axis, skipna, numeric_only, **kwargs
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/generic.py", line 12442, in _stat_function
+    return self._reduce(
+           ~~~~~~~~~~~~^
+        func, name=name, axis=axis, skipna=skipna, numeric_only=numeric_only
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/series.py", line 6478, in _reduce
+    return op(delegate, skipna=skipna, **kwds)
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/nanops.py", line 147, in f
+    result = alt(values, axis=axis, skipna=skipna, **kwds)
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/nanops.py", line 404, in new_func
+    result = func(values, axis=axis, skipna=skipna, mask=mask, **kwargs)
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/nanops.py", line 720, in nanmean
+    the_sum = _ensure_numeric(the_sum)
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/nanops.py", line 1701, in _ensure_numeric
+    raise TypeError(f"Could not convert string '{x}' to numeric")
+TypeError: Could not convert string '89' to numeric
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/peipr/gits/quantitative_analysis/run_pipeline.py", line 387, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "/home/peipr/gits/quantitative_analysis/run_pipeline.py", line 370, in main
+    _run_eda_and_patient_plots(processed_telemetry, output_base)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/peipr/gits/quantitative_analysis/run_pipeline.py", line 178, in _run_eda_and_patient_plots
+    stage_summary = fn.compute_stage_summary(telemetry_df, metrics=DEFAULT_EDA_METRICS)
+  File "/home/peipr/gits/quantitative_analysis/functions.py", line 2386, in compute_stage_summary
+    .agg(["mean", "std"])
+     ~~~^^^^^^^^^^^^^^^^^
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/groupby/generic.py", line 1432, in aggregate
+    result = op.agg()
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/apply.py", line 193, in agg
+    return self.agg_list_like()
+           ~~~~~~~~~~~~~~~~~~^^
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/apply.py", line 326, in agg_list_like
+    return self.agg_or_apply_list_like(op_name="agg")
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/apply.py", line 1566, in agg_or_apply_list_like
+    keys, results = self.compute_list_like(op_name, selected_obj, kwargs)
+                    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/apply.py", line 385, in compute_list_like
+    new_res = getattr(colg, op_name)(func, *args, **kwargs)
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/groupby/generic.py", line 257, in aggregate
+    ret = self._aggregate_multiple_funcs(func, *args, **kwargs)
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/groupby/generic.py", line 362, in _aggregate_multiple_funcs
+    results[key] = self.aggregate(func, *args, **kwargs)
+                   ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/groupby/generic.py", line 249, in aggregate
+    return getattr(self, func)(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/groupby/groupby.py", line 2459, in mean
+    result = self._cython_agg_general(
+        "mean",
+        alt=lambda x: Series(x, copy=False).mean(numeric_only=numeric_only),
+        numeric_only=numeric_only,
+    )
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/groupby/groupby.py", line 2005, in _cython_agg_general
+    new_mgr = data.grouped_reduce(array_func)
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/internals/base.py", line 367, in grouped_reduce
+    res = func(arr)
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/groupby/groupby.py", line 2002, in array_func
+    result = self._agg_py_fallback(how, values, ndim=data.ndim, alt=alt)
+  File "/home/peipr/gits/quantitative_analysis/.venv/lib/python3.14/site-packages/pandas/core/groupby/groupby.py", line 1948, in _agg_py_fallback
+    raise type(err)(msg) from err
+TypeError: agg function failed [how->mean,dtype->object]

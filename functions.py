@@ -11,7 +11,6 @@ This module provides utilities for:
 - Unsupervised machine learning (PCA, K-Means, DBSCAN)
 - Output export
 
-All functions follow PEP 8, include NumPy-style docstrings, and use type hints.
 """
 
 import logging
