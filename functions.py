@@ -877,6 +877,15 @@ def _parse_telemetry(df: pd.DataFrame) -> pd.DataFrame:
     df = df[time_mask & ~annotation_mask].copy()
 
     df.reset_index(drop=True, inplace=True)
+    
+    # Convert numeric columns (except Stage) to numeric, replacing commas with periods
+    for col in df.columns:
+        if col != "Stage":
+            df[col] = pd.to_numeric(
+                df[col].astype(str).str.replace(",", ".", regex=False),
+                errors="coerce"
+            )
+    
     return df
 
 
@@ -2407,7 +2416,15 @@ def compute_stage_summary(
     if metrics is None:
         metrics = telemetry_df.select_dtypes(include=[np.number]).columns.tolist()
 
-    available = [m for m in metrics if m in telemetry_df.columns]
+    numeric_cols = telemetry_df.select_dtypes(include=[np.number]).columns.tolist()
+    available = [m for m in metrics if m in telemetry_df.columns and m in numeric_cols]
+    
+    if not available:
+        raise ValueError(
+            f"No numeric columns found in requested metrics. "
+            f"Requested: {metrics}, Available numeric: {numeric_cols}"
+        )
+    
     summary = (
         telemetry_df.groupby("Stage", observed=True)[available]
         .agg(["mean", "std"])
