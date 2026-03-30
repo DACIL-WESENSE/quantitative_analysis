@@ -113,12 +113,17 @@ def _extract_patient_timeseries(
 ) -> Tuple[pd.DataFrame, Dict[str, Dict[str, object]]]:
     """Load L1/L2 BDF files and extract time-resolved ECG features."""
     l1, l2 = fn.find_bdf_files(patient_folder)
-    sensor_paths = {"L1": l1, "L2": l2}
+    sensor_paths = [("L1", l1), ("L2", l2)]
 
     sensors: Dict[str, Dict[str, object]] = {}
     frames: List[pd.DataFrame] = []
 
-    for sensor_label, bdf_path in sensor_paths.items():
+    for sensor_label, bdf_path in tqdm(
+        sensor_paths,
+        desc="Processing sensors",
+        unit="sensor",
+        leave=False,
+    ):
         if bdf_path is None:
             continue
         raw = fn.load_ecg(bdf_path)
@@ -160,6 +165,15 @@ def _save_patient_ecg_plots(
     """Generate and save patient ECG plots."""
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    plot_stages = [
+        ("Heart rate", "ecg_hr"),
+        ("HRV time-domain", "ecg_hrv_timedomain"),
+        ("HRV frequency-domain", "ecg_hrv_freqdomain"),
+        ("Breathing rate", "ecg_breathing"),
+        ("Raw ECG preview", "ecg_raw_preview"),
+    ]
+    pbar = tqdm(total=len(plot_stages), desc="Generating ECG plots", unit="plot", leave=False)
+
     fig_hr, ax_hr = plt.subplots(figsize=(13, 4))
     for (sensor, channel), group_df in ts_all.groupby(["sensor", "channel"], sort=False):
         t_min = group_df["time_s"] / 60
@@ -172,6 +186,7 @@ def _save_patient_ecg_plots(
     fig_hr.tight_layout()
     fn._save_figure(fig_hr, out_dir, f"{patient_id}_ecg_hr.png")
     plt.close(fig_hr)
+    pbar.update(1)
 
     fig_td, axes_td = plt.subplots(2, 1, figsize=(13, 6), sharex=True)
     for (sensor, channel), group_df in ts_all.groupby(["sensor", "channel"], sort=False):
@@ -188,6 +203,7 @@ def _save_patient_ecg_plots(
     fig_td.tight_layout()
     fn._save_figure(fig_td, out_dir, f"{patient_id}_ecg_hrv_timedomain.png")
     plt.close(fig_td)
+    pbar.update(1)
 
     freq_metrics = [
         ("lf_ms2", "LF power (ms²)"),
@@ -209,6 +225,7 @@ def _save_patient_ecg_plots(
     fig_fd.tight_layout()
     fn._save_figure(fig_fd, out_dir, f"{patient_id}_ecg_hrv_freqdomain.png")
     plt.close(fig_fd)
+    pbar.update(1)
 
     fig_br, ax_br = plt.subplots(figsize=(13, 4))
     for (sensor, channel), group_df in ts_all.groupby(["sensor", "channel"], sort=False):
@@ -227,11 +244,13 @@ def _save_patient_ecg_plots(
     fig_br.tight_layout()
     fn._save_figure(fig_br, out_dir, f"{patient_id}_ecg_breathing.png")
     plt.close(fig_br)
+    pbar.update(1)
 
     n_panels = sum(
         int(np.asarray(sensor_info["data"]).shape[0]) for sensor_info in sensors.values()
     )
     if n_panels == 0:
+        pbar.close()
         return
 
     fig_preview, axes_preview = plt.subplots(
@@ -275,6 +294,8 @@ def _save_patient_ecg_plots(
     fig_preview.tight_layout()
     fn._save_figure(fig_preview, out_dir, f"{patient_id}_ecg_raw_preview.png")
     plt.close(fig_preview)
+    pbar.update(1)
+    pbar.close()
 
 
 def _run_batch_summary(
@@ -286,7 +307,11 @@ def _run_batch_summary(
     all_folders = fn.discover_patient_folders(str(data_root))
     rows: List[Dict[str, float | str]] = []
 
-    for folder in tqdm(all_folders, desc="Batch ECG summary"):
+    for folder in tqdm(
+        all_folders,
+        desc="Processing patients (batch ECG)",
+        unit="patient",
+    ):
         l1, l2 = fn.find_bdf_files(folder)
         frames: List[pd.DataFrame] = []
         for sensor_label, bdf_path in [("L1", l1), ("L2", l2)]:

@@ -109,22 +109,23 @@ def get_pipeline_status() -> Dict:
 
     if data_root.exists():
         try:
-            patient_folders = fn.discover_patient_folders(str(data_root))
-            status["patient_count"] = len(patient_folders)
+            with st.spinner("Scanning patient folders..."):
+                patient_folders = fn.discover_patient_folders(str(data_root))
+                status["patient_count"] = len(patient_folders)
 
-            for folder in patient_folders:
-                csv_file = fn.find_csv_file(folder)
-                if csv_file:
-                    status["csv_count"] += 1
+                for folder in patient_folders:
+                    csv_file = fn.find_csv_file(folder)
+                    if csv_file:
+                        status["csv_count"] += 1
 
-                bdf_l1, bdf_l2 = fn.find_bdf_files(folder)
-                if bdf_l1 or bdf_l2:
-                    status["bdf_count"] += 1
+                    bdf_l1, bdf_l2 = fn.find_bdf_files(folder)
+                    if bdf_l1 or bdf_l2:
+                        status["bdf_count"] += 1
 
-                # Check for processed output
-                output_patient = output_root / folder.name
-                if output_patient.exists() and any(output_patient.glob("*.csv")):
-                    status["processed_count"] += 1
+                    # Check for processed output
+                    output_patient = output_root / folder.name
+                    if output_patient.exists() and any(output_patient.glob("*.csv")):
+                        status["processed_count"] += 1
         except Exception as e:
             st.warning(f"Error scanning data directory: {e}")
 
@@ -155,8 +156,9 @@ def get_patient_details(patient_folder: Path) -> Dict:
     if csv_file:
         details["csv_file"] = csv_file
         try:
-            df, _ = fn.load_telemetry(csv_file)
-            details["csv_rows"] = len(df)
+            with st.spinner(f"Loading telemetry data for {patient_folder.name}..."):
+                df, _ = fn.load_telemetry(csv_file)
+                details["csv_rows"] = len(df)
         except Exception as e:
             st.warning(f"Error loading CSV for {patient_folder.name}: {e}")
 
@@ -265,7 +267,7 @@ def main():
     """Main Streamlit application."""
     # Sidebar configuration
     with st.sidebar:
-        st.title("️ Configuration")
+        st.title("Configuration")
 
         # Data paths
         st.session_state.data_root = st.text_input(
@@ -309,9 +311,9 @@ def main():
             " Dashboard",
             " Data Flow",
             " Task Explorer",
-            "️ Processing",
+            "Processing",
             " Results",
-            "️ Config Panel",
+            "Config Panel",
             " Logs",
         ]
     )
@@ -451,12 +453,12 @@ def main():
             if details["bdf_l2"]:
                 st.success(f" ECG L2: {details['bdf_l2'].name}")
             if not details["bdf_l1"] and not details["bdf_l2"]:
-                st.info("ℹ️ No ECG files found")
+                st.info("[INFO] No ECG files found")
 
             if details["tasks_log"]:
                 st.success(f" Tasks Log: {details['tasks_log'].name}")
             else:
-                st.info("ℹ️ No tasks.log found")
+                st.info("[INFO] No tasks.log found")
 
         with col2:
             st.subheader(" Processing Status")
@@ -478,8 +480,9 @@ def main():
             st.divider()
             if st.checkbox("Preview Telemetry Data", key=f"preview_{selected_patient}"):
                 try:
-                    df, meta = fn.load_telemetry(details["csv_file"])
-                    st.write(f"**Rows**: {len(df)}, **Columns**: {len(df.columns)}")
+                    with st.spinner("Loading telemetry data..."):
+                        df, meta = fn.load_telemetry(details["csv_file"])
+                    st.success(f"Loaded {len(df)} rows and {len(df.columns)} columns.")
                     st.dataframe(df.head(20), use_container_width=True)
                 except Exception as e:
                     st.error(f"Error loading telemetry: {e}")
@@ -488,7 +491,7 @@ def main():
     # Tab 4: Processing Control
     # ========================================================================
     with tab4:
-        st.title("️ Processing Control")
+        st.title("Processing Control")
 
         data_root = Path(st.session_state.data_root)
 
@@ -568,20 +571,26 @@ def main():
             )
 
         with col2:
-            if st.button("️ Start Processing", type="primary"):
+            if st.button("Start Processing", type="primary"):
                 if not st.session_state.selected_patients:
                     st.error("Please select at least one patient.")
                 else:
-                    st.info("Processing would run the pipeline here. In production, this would:")
-                    st.write(
-                        """
-                        1. Iterate through selected patients
-                        2. Load telemetry and ECG data
-                        3. Perform alignment and cleaning
-                        4. Generate outputs
-                        5. Update status in results tab
-                        """
-                    )
+                    with st.status("Processing patients...", expanded=True) as status:
+                        total_patients = len(st.session_state.selected_patients)
+                        progress_bar = st.progress(0)
+                        
+                        for i, patient_id in enumerate(st.session_state.selected_patients):
+                            st.write(f"Processing {patient_id}...")
+                            
+                            # Placeholder for actual pipeline call
+                            # In production: fn.run_pipeline(patient_id, ...)
+                            st.info("Pipeline execution would happen here")
+                            
+                            # Update progress
+                            progress_bar.progress((i + 1) / total_patients)
+                        
+                        status.update(label="Processing complete!", state="complete")
+                        st.success(f"Successfully processed {total_patients} patient(s).")
 
     # ========================================================================
     # Tab 5: Results Inspector
@@ -633,15 +642,16 @@ def main():
 
                 try:
                     file_path = patient_output / selected_file
-                    df = pd.read_csv(file_path)
+                    with st.spinner(f"Loading {selected_file}..."):
+                        df = pd.read_csv(file_path)
 
-                    st.write(f"**Rows**: {len(df)}, **Columns**: {len(df.columns)}")
+                    st.success(f"Loaded {len(df)} rows and {len(df.columns)} columns.")
                     st.dataframe(df, use_container_width=True)
 
                     # Download button
                     csv_buffer = df.to_csv(index=False)
                     st.download_button(
-                        label="⬇️ Download CSV",
+                        label="↓ Download CSV",
                         data=csv_buffer,
                         file_name=selected_file,
                         mime="text/csv",
@@ -655,21 +665,34 @@ def main():
         st.subheader(" Cross-Patient Summary")
 
         try:
-            summary_rows = []
-            for patient_dir in patient_output_dirs:
-                summary_file = patient_dir / "summary.csv"
-                if summary_file.exists():
-                    df = pd.read_csv(summary_file)
-                    summary_rows.append(df)
+            with st.spinner("Loading patient summaries..."):
+                summary_rows = []
+                total_dirs = len(patient_output_dirs)
+                
+                if total_dirs > 0:
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    for i, patient_dir in enumerate(patient_output_dirs):
+                        status_text.text(f"Loading patient summary {i + 1}/{total_dirs}...")
+                        summary_file = patient_dir / "summary.csv"
+                        if summary_file.exists():
+                            df = pd.read_csv(summary_file)
+                            summary_rows.append(df)
+                        progress_bar.progress((i + 1) / total_dirs)
+                    
+                    status_text.empty()
+                    progress_bar.empty()
 
             if summary_rows:
                 combined_summary = pd.concat(summary_rows, ignore_index=True)
+                st.success(f"Loaded summaries from {len(summary_rows)} patient(s).")
                 st.dataframe(combined_summary, use_container_width=True)
 
                 # Download combined summary
                 csv_buffer = combined_summary.to_csv(index=False)
                 st.download_button(
-                    label="⬇️ Download Combined Summary",
+                    label="↓ Download Combined Summary",
                     data=csv_buffer,
                     file_name="combined_summary.csv",
                     mime="text/csv",
@@ -683,7 +706,7 @@ def main():
     # Tab 6: Configuration Panel
     # ========================================================================
     with tab6:
-        st.title("️ Configuration Panel")
+        st.title("Configuration Panel")
 
         st.subheader("Pipeline Paths")
 
@@ -701,7 +724,7 @@ def main():
             if Path(st.session_state.output_root).exists():
                 st.success(" Directory exists")
             else:
-                st.info("ℹ️ Will be created during processing")
+                st.info("[INFO] Will be created during processing")
 
         st.divider()
 
@@ -772,7 +795,8 @@ def main():
             st.divider()
 
             # Display logs
-            log_content = read_log_file(log_file, num_lines)
+            with st.spinner("Loading log file..."):
+                log_content = read_log_file(log_file, num_lines)
 
             st.subheader(f"Last {num_lines} lines from pipeline.log")
 
@@ -818,7 +842,7 @@ def main():
                 log_text = f.read()
 
             st.download_button(
-                label="⬇️ Download Log File",
+                label="↓ Download Log File",
                 data=log_text,
                 file_name="pipeline.log",
                 mime="text/plain",

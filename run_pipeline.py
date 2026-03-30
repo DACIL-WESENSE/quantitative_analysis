@@ -150,10 +150,15 @@ def _process_patients(
                 concurrent.futures.as_completed(futures),
                 total=len(futures),
                 desc="Processing patients",
+                unit="patient",
             ):
                 _collect_result(future.result())
     else:
-        for folder in tqdm(patient_folders, desc="Processing patients"):
+        for folder in tqdm(
+            patient_folders,
+            desc="Processing patients",
+            unit="patient",
+        ):
             _collect_result(
                 fn.process_patient(
                     folder,
@@ -172,7 +177,11 @@ def _run_eda_and_patient_plots(
     """Run per-patient EDA and physiology plots."""
     br_records: List[Dict[str, float]] = []
 
-    for patient_id, telemetry_df in tqdm(processed_telemetry.items(), desc="Patient plots"):
+    for patient_id, telemetry_df in tqdm(
+        processed_telemetry.items(),
+        desc="Generating patient plots",
+        unit="patient",
+    ):
         patient_out = output_base / patient_id
 
         stage_summary = fn.compute_stage_summary(telemetry_df, metrics=DEFAULT_EDA_METRICS)
@@ -249,6 +258,7 @@ def _run_ml_sections(
 
     stage_labels = all_tele["Stage"].fillna("Unknown").reset_index(drop=True)
 
+    LOGGER.info("Running PCA...")
     pca_model, x_pca = fn.run_pca(x_scaled, n_components=min(10, x_scaled.shape[1]))
     fig_scree = fn.plot_scree(pca_model, output_dir=output_base)
     fig_pca_2d = fn.plot_pca_scatter(
@@ -268,6 +278,7 @@ def _run_ml_sections(
         plt.close(fig_pca_3d)
 
     if x_scaled.shape[0] > 10:
+        LOGGER.info("Generating elbow plot...")
         max_k = min(10, x_scaled.shape[0] - 1)
         fig_elbow = fn.elbow_plot(
             x_scaled,
@@ -286,6 +297,7 @@ def _run_ml_sections(
     y_vis = hr_col or feature_df.columns[min(1, len(feature_df.columns) - 1)]
 
     if x_scaled.shape[0] >= kmeans_clusters:
+        LOGGER.info("Running K-Means clustering...")
         _, km_labels = fn.run_kmeans(x_scaled, n_clusters=kmeans_clusters)
         fig_km = fn.plot_cluster_scatter(
             feature_df,
@@ -307,6 +319,7 @@ def _run_ml_sections(
         plt.close(fig_pca_km)
 
     if x_scaled.shape[0] >= 10:
+        LOGGER.info("Running DBSCAN clustering...")
         _, db_labels = fn.run_dbscan(
             x_scaled, eps=dbscan_eps, min_samples=dbscan_min_samples
         )

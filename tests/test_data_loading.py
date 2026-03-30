@@ -200,7 +200,7 @@ class TestExtractEcgTimeseries:
 
     def test_extract_timeseries_basic(self, sample_raw_bdf_like):
         """Should extract time-series ECG features."""
-        features = fn.extract_ecg_timeseries(sample_raw_bdf_like, window_duration=30.0)
+        features = fn.extract_ecg_timeseries(sample_raw_bdf_like, window_duration=30.0, show_progress=False)
         
         assert features is not None
         assert len(features) > 0
@@ -210,14 +210,14 @@ class TestExtractEcgTimeseries:
 
     def test_extract_timeseries_multiple_windows(self, sample_raw_bdf_like):
         """Should create multiple time windows."""
-        features = fn.extract_ecg_timeseries(sample_raw_bdf_like, window_duration=20.0)
+        features = fn.extract_ecg_timeseries(sample_raw_bdf_like, window_duration=20.0, show_progress=False)
         
         # With 120 s recording and 20 s windows, should have 6 windows per channel
         assert len(features) >= 4  # At least a few windows
 
     def test_extract_timeseries_hrv_metrics(self, sample_raw_bdf_like):
         """Should include HRV metrics in output."""
-        features = fn.extract_ecg_timeseries(sample_raw_bdf_like, window_duration=30.0)
+        features = fn.extract_ecg_timeseries(sample_raw_bdf_like, window_duration=30.0, show_progress=False)
         
         # Check for HRV-related columns
         hrv_cols = ["rmssd_ms", "sdnn_ms", "lf_ms2", "hf_ms2", "lf_hf_ratio"]
