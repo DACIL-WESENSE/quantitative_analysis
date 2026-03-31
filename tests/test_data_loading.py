@@ -13,6 +13,7 @@ Coverage:
 import pytest
 import pandas as pd
 import numpy as np
+import mne
 from pathlib import Path
 import sys
 import functions as fn
@@ -223,6 +224,22 @@ class TestExtractEcgTimeseries:
         hrv_cols = ["rmssd_ms", "sdnn_ms", "lf_ms2", "hf_ms2", "lf_hf_ratio"]
         for col in hrv_cols:
             assert col in features.columns
+
+    def test_extract_timeseries_breathing_rate_reasonable(self):
+        """Breathing-rate output should stay in a physiologic range on synthetic ECG."""
+        sfreq = 256
+        duration = 120
+        n_samples = sfreq * duration
+        t = np.linspace(0, duration, n_samples)
+        signal = 100 * np.sin(2 * np.pi * (70 / 60) * t / 60) + 30 * np.random.randn(n_samples)
+        info = mne.create_info(ch_names=["ECG"], sfreq=sfreq, ch_types=["ecg"])
+        raw = mne.io.RawArray(signal[np.newaxis, :], info, verbose=False)
+
+        features = fn.extract_ecg_timeseries(raw, window_duration=30.0, show_progress=False)
+
+        br_values = pd.to_numeric(features["breathing_rate_bpm"], errors="coerce").dropna()
+        assert len(br_values) > 0
+        assert br_values.between(4, 30).all()
 
 
 class TestSyncEcgWithTelemetry:

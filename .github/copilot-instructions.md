@@ -4,7 +4,10 @@
 
 This is a batch analysis pipeline for exercise physiology data from the DACIL-WESENSE study. It processes per-patient folders containing:
 - A `.csv` telemetry file (exercise metrics like HR, VO2, VCO2, Power, RER, SpO2)
-- Optional `.bdf` ECG files (L1 and L2 sensors, named `WESENSETEST_<id>_L1_ECG*.bdf` / `_L2_ECG*.bdf`)
+- Optional `.bdf` ECG files (L1 and L2 sensors, named `L1` and `L2`; `.bdf`
+  extensions are also accepted)
+  
+In this project, the AI is not allowed to make any commits by itself without previous human review.
 
 ## Running the pipeline
 
