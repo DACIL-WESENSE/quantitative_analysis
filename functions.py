@@ -108,7 +108,7 @@ TELEMETRY_TIME_CANDIDATES: List[str] = [
 ]
 
 _BDF_PATIENT_ID_RE = re.compile(
-    r"(WESENSETEST[_-]?[A-Z0-9]+)(?=(_L[12]_ECG|$))",
+    r"(WESENSETEST[_-]?[A-Z0-9]+)(?=(_L[12](?:_ECG)?|$))",
     flags=re.IGNORECASE,
 )
 _WESENSE_PATIENT_ID_RE = re.compile(
@@ -206,6 +206,10 @@ def _extract_patient_id_from_filename(path: Optional[Path]) -> Optional[str]:
     if path is None:
         return None
     stem = path.stem
+
+    # Sensor-only ECG files do not carry a patient identifier.
+    if stem.upper() in {"L1", "L2"}:
+        return None
 
     for regex in (_BDF_PATIENT_ID_RE, _WESENSE_PATIENT_ID_RE, _GENERIC_PATIENT_ID_RE):
         match = regex.search(stem)
@@ -343,10 +347,10 @@ def discover_patient_folders(root_dir: str) -> List[Path]:
 def find_bdf_files(folder: Path) -> Tuple[Optional[Path], Optional[Path]]:
     """Find the L1 and L2 BDF ECG files inside *folder* (recursively).
 
-    The expected naming pattern is::
-
-        WESENSETEST_<id>_L1_ECG*.bdf
-        WESENSETEST_<id>_L2_ECG*.bdf
+    Preferred naming is sensor files named ``L1`` and ``L2`` within each
+    patient folder. Files with a ``.bdf`` extension are accepted as well.
+    Legacy ``WESENSETEST_<id>_L1_ECG*.bdf`` / ``..._L2_ECG*.bdf`` files are
+    still accepted as a fallback for backwards compatibility.
 
     Parameters
     ----------
@@ -362,15 +366,25 @@ def find_bdf_files(folder: Path) -> Tuple[Optional[Path], Optional[Path]]:
     l2_path: Optional[Path] = None
 
     bdf_files = sorted(
-        _iter_files(folder, "*.bdf"),
+        _iter_files(folder, "*"),
         key=lambda p: _natural_sort_key(str(p.relative_to(folder)).replace(os.sep, "/")),
     )
+
     for bdf in bdf_files:
-        name = bdf.name.upper()
-        if "_L1_ECG" in name and l1_path is None:
+        stem_upper = bdf.stem.upper()
+        suffix_lower = bdf.suffix.lower()
+        if stem_upper == "L1" and suffix_lower in {"", ".bdf"} and l1_path is None:
             l1_path = bdf
-        elif "_L2_ECG" in name and l2_path is None:
+        elif stem_upper == "L2" and suffix_lower in {"", ".bdf"} and l2_path is None:
             l2_path = bdf
+
+    if l1_path is None or l2_path is None:
+        for bdf in bdf_files:
+            name = bdf.name.upper()
+            if l1_path is None and "_L1_ECG" in name and bdf.suffix.lower() == ".bdf":
+                l1_path = bdf
+            elif l2_path is None and "_L2_ECG" in name and bdf.suffix.lower() == ".bdf":
+                l2_path = bdf
 
     return l1_path, l2_path
 

@@ -16,15 +16,6 @@ conda activate quantitative_analysis
 pip install -r requirements.txt
 ```
 
-**Jupyter kernel registration** (run once after creating the env)
-
-```bash
-python -m ipykernel install --user --name quantitative_analysis --display-name "quantitative_analysis"
-```
-
-Notebook execution remains available, but the primary entrypoints are now
-regular Python scripts (`run_pipeline.py` and `run_ecg.py`).
-
 ---
 
 ## Input data format
@@ -41,8 +32,10 @@ data/
 └── Patient 1/                          ← any name; becomes the patient ID
     ├── WESENSET<id>.csv                ← CPET telemetry (preferred)
     ├── WESENSET<id>.xls                ← or CPET telemetry (auto-converted to CSV)
-    ├── WESENSETEST_<id>_L1_ECG*.bdf    ← ECG recording, sensor L1 (optional)
-    └── WESENSETEST_<id>_L2_ECG*.bdf    ← ECG recording, sensor L2 (optional)
+    ├── L1.bdf                          ← ECG recording, sensor L1 (optional)
+    ├── L2.bdf                          ← ECG recording, sensor L2 (optional)
+    └── tasks.log                       ← Raw tasklog
+
 ```
 
 Multiple patient folders are supported:
@@ -57,17 +50,6 @@ data/
 Any extra files in a patient folder (`.dat`, `.log`, etc.) are ignored.
 
 ### CPET telemetry file (`.csv` or `.xls`)
-
-The raw export from the WESENSE system is saved as `.xls` but is actually a
-**tab-separated text file** encoded in ISO-8859-1. The pipeline automatically
-converts XLS to CSV when needed—just place the files in patient folders and the
-pipeline handles the conversion transparently via `find_csv_file()`.
-
-If you prefer to convert manually before running the pipeline, use `xls_to_csv.py`:
-
-```bash
-python xls_to_csv.py
-```
 
 After conversion (automatic or manual), the CSV has the following structure:
 
@@ -107,12 +89,10 @@ exports, keep only the intended file.
 BDF files are loaded with MNE.  Both L1 and L2 are optional — missing files
 generate a warning and the pipeline continues without ECG features.
 
-Naming pattern (case-insensitive):
-
-```
-WESENSETEST_<id>_L1_ECG<anything>.bdf
-WESENSETEST_<id>_L2_ECG<anything>.bdf
-```
+Naming convention: ECG files are simply named `L1` and `L2` within each patient
+folder (case-insensitive). If your export still includes a `.bdf` extension,
+the loader accepts it, and legacy naming patterns (e.g.,
+`WESENSETEST_<id>_L1_ECG*.bdf`) are still supported for backwards compatibility.
 
 ---
 
@@ -387,21 +367,6 @@ start a fresh log, delete the file before running.
 
 ---
 
-## COPD risk scoring
+# AI disclosure
 
-`copd_risk.ipynb` derives a risk score from 9 CPET markers.  Each marker is
-compared against the threshold below; a flag of `1` means the value is in the
-range associated with elevated COPD risk.
-
-| Marker                   | CSV column(s)                      | Flag condition | Threshold    | Source                          |
-|--------------------------|------------------------------------|----------------|--------------|---------------------------------|
-| Peak VO₂/kg              | `V'O2` ÷ weight                    | `< threshold`  | 20 mL/min/kg | ATS/ACCP 2003                   |
-| VE/VCO₂ slope            | `V'E`, `V'CO2` (linear regression) | `> threshold`  | 34           | Puente-Maestu *et al.* ERJ 2016 |
-| SpO₂ nadir               | `SpO2`                             | `< threshold`  | 95 %         | ATS/ERS                         |
-| SpO₂ drop                | baseline − nadir                   | `≥ threshold`  | 4 pp         | ATS/ERS                         |
-| Peak breathing frequency | `BF`                               | `> threshold`  | 40 br/min    | Wasserman 5th ed.               |
-| Peak RER                 | `RER`                              | `< threshold`  | 1.0          | Wasserman 5th ed.               |
-| Peak O₂ pulse            | `VO2/HR`                           | `< threshold`  | 10 mL/beat   | Wasserman 5th ed.               |
-| VT1 presence             | `Stage == "VT1"`                   | absent (= 0)   | —            | —                               |
-
-GitHub Copilot was used to aid in the development of this codebase. However, at no point in time was the Copilot process able to interact with patient data, nor was it fed patient data. All Copilot outputs were manually checked by a human.
+GitHub Copilot was used to aid in the development of this codebase. However, at no point in time was the Copilot process physically able to interact with patient data. All Copilot outputs were manually checked by a human.

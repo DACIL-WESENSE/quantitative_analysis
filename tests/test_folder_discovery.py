@@ -108,7 +108,7 @@ class TestResolvePatientId:
         assert len(result) > 0
 
     def test_precedence_bdf_third(self, sample_patient_folder):
-        """BDF filename should be used when CSV is missing."""
+        """Legacy BDF filename should still be used when CSV is missing."""
         bdf_path = Path("WESENSETEST_BDFID_L1_ECG.bdf")
         
         result = fn.resolve_patient_id(
@@ -117,7 +117,19 @@ class TestResolvePatientId:
             csv_path=None,
             bdf_paths=(bdf_path, None),
         )
-        assert "BDFID" in result or "WESENSETEST" in result
+        assert result == "WESENSETEST_BDFID"
+
+    def test_sensor_only_bdf_falls_back_to_folder_name(self, sample_patient_folder):
+        """Sensor-only ECG filenames should not be treated as patient IDs."""
+        bdf_path = Path("L1")
+
+        result = fn.resolve_patient_id(
+            sample_patient_folder,
+            info_df=None,
+            csv_path=None,
+            bdf_paths=(bdf_path, None),
+        )
+        assert result == "PATIENT001"
 
     def test_fallback_to_folder_name(self, sample_patient_folder):
         """Folder name should be last resort fallback."""
@@ -252,7 +264,7 @@ class TestFindBdfFiles:
 
     def test_find_l1_bdf(self, temp_dir):
         """Should find L1 ECG file with correct naming."""
-        bdf_l1 = temp_dir / "WESENSETEST_001_L1_ECG.bdf"
+        bdf_l1 = temp_dir / "L1"
         bdf_l1.touch()
 
         l1, l2 = fn.find_bdf_files(temp_dir)
@@ -261,7 +273,7 @@ class TestFindBdfFiles:
 
     def test_find_l2_bdf(self, temp_dir):
         """Should find L2 ECG file with correct naming."""
-        bdf_l2 = temp_dir / "WESENSETEST_001_L2_ECG.bdf"
+        bdf_l2 = temp_dir / "L2"
         bdf_l2.touch()
 
         l1, l2 = fn.find_bdf_files(temp_dir)
@@ -270,8 +282,8 @@ class TestFindBdfFiles:
 
     def test_find_both_l1_and_l2(self, temp_dir):
         """Should find both L1 and L2 ECG files."""
-        bdf_l1 = temp_dir / "WESENSETEST_001_L1_ECG.bdf"
-        bdf_l2 = temp_dir / "WESENSETEST_001_L2_ECG.bdf"
+        bdf_l1 = temp_dir / "L1"
+        bdf_l2 = temp_dir / "L2"
         bdf_l1.touch()
         bdf_l2.touch()
 
@@ -281,7 +293,15 @@ class TestFindBdfFiles:
 
     def test_find_bdf_case_insensitive(self, temp_dir):
         """Should find BDF files regardless of case."""
-        bdf_l1 = temp_dir / "WESENSETEST_001_l1_ecg.bdf"
+        bdf_l1 = temp_dir / "l1"
+        bdf_l1.touch()
+
+        l1, l2 = fn.find_bdf_files(temp_dir)
+        assert l1 == bdf_l1
+
+    def test_find_legacy_bdf_extension(self, temp_dir):
+        """Should still accept the legacy .bdf extension."""
+        bdf_l1 = temp_dir / "L1.bdf"
         bdf_l1.touch()
 
         l1, l2 = fn.find_bdf_files(temp_dir)
@@ -291,7 +311,7 @@ class TestFindBdfFiles:
         """Should find BDF files in subdirectories."""
         subdir = temp_dir / "ecg_data"
         subdir.mkdir()
-        bdf_l1 = subdir / "WESENSETEST_001_L1_ECG.bdf"
+        bdf_l1 = subdir / "L1"
         bdf_l1.touch()
 
         l1, l2 = fn.find_bdf_files(temp_dir)
