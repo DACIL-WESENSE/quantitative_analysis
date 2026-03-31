@@ -344,6 +344,17 @@ output/
 ├── elbow.png                           ← K-Means inertia vs K
 ├── kmeans_clusters.png                 ← K-Means cluster scatter
 ├── dbscan_clusters.png                 ← DBSCAN cluster scatter
+├── ecg_batch_summary.csv               ← optional cross-patient ECG summary from `run_ecg.py`
+├── ecg_batch_summary.png               ← optional ECG summary plot from `run_ecg.py`
+├── ecg_analysis/                       ← ECG-focused outputs from `run_ecg.py`
+│   └── <patient_id>/
+│       ├── <patient_id>_ecg_timeseries.csv      ← windowed ECG features
+│       ├── <patient_id>_ecg_summary_stats.csv   ← aggregate ECG metrics
+│       ├── <patient_id>_ecg_hr.png              ← heart-rate trace
+│       ├── <patient_id>_ecg_hrv_timedomain.png  ← RMSSD/SDNN traces
+│       ├── <patient_id>_ecg_hrv_freqdomain.png   ← LF/HF traces
+│       ├── <patient_id>_ecg_breathing.png       ← breathing-rate trace
+│       └── <patient_id>_ecg_raw_preview.png     ← raw ECG preview with R-peaks
 │
 ├── <patient_id>/                       ← one sub-folder per patient
 │   ├── <patient_id>_telemetry.csv      ← cleaned telemetry with Stage column
