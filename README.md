@@ -114,6 +114,17 @@ python run_ecg.py --data-root data --output-root output
 
 Results are written to `./output/`.
 
+### Streamlit dashboard
+
+To explore the generated results in a graphical dashboard, run:
+
+```bash
+streamlit run streamlit_app.py
+```
+
+The dashboard reads the existing files in `output/` and does not rerun the
+analysis pipeline.
+
 **Note**: If you prefer to convert XLS files manually before running the pipeline:
 ```bash
 python xls_to_csv.py   # Pre-convert all .xls to .csv (optional)
