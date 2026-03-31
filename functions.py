@@ -375,8 +375,42 @@ def find_bdf_files(folder: Path) -> Tuple[Optional[Path], Optional[Path]]:
     return l1_path, l2_path
 
 
+def find_xls_file(folder: Path) -> Optional[Path]:
+    """Find the best telemetry ``.xls`` file in *folder* recursively.
+
+    Parameters
+    ----------
+    folder : Path
+        Patient folder to search.
+
+    Returns
+    -------
+    Optional[Path]
+        Path to the best telemetry XLS file, or ``None`` if not found.
+    """
+    files = _iter_files(folder, "*.xls")
+    if not files:
+        return None
+
+    scored: List[Tuple[Tuple, Path]] = []
+    for path in files:
+        name_u = path.name.upper()
+        score = (
+            0 if "WESENSE" in name_u else 1,
+            1 if "ECG" in name_u else 0,
+            _natural_sort_key(str(path.relative_to(folder)).replace(os.sep, "/")),
+        )
+        scored.append((score, path))
+
+    scored.sort(key=lambda item: item[0])
+    return scored[0][1]
+
+
 def find_csv_file(folder: Path) -> Optional[Path]:
     """Return the best telemetry ``.csv`` file found in *folder* recursively.
+
+    If no CSV is found, searches for XLS files and automatically converts the
+    best match to CSV using convert_xls_to_csv().
 
     Parameters
     ----------
@@ -389,22 +423,35 @@ def find_csv_file(folder: Path) -> Optional[Path]:
         Path to the telemetry CSV file, or ``None`` if not found.
     """
     files = _iter_files(folder, "*.csv")
-    if not files:
+    if files:
+        scored: List[Tuple[Tuple, Path]] = []
+        for path in files:
+            name_u = path.name.upper()
+            score = (
+                0 if _csv_looks_like_telemetry(path) else 1,
+                0 if "WESENSE" in name_u else 1,
+                1 if "ECG" in name_u else 0,
+                _natural_sort_key(str(path.relative_to(folder)).replace(os.sep, "/")),
+            )
+            scored.append((score, path))
+
+        scored.sort(key=lambda item: item[0])
+        return scored[0][1]
+
+    # No CSV found; try to find and convert XLS file.
+    xls_path = find_xls_file(folder)
+    if xls_path is None:
         return None
 
-    scored: List[Tuple[Tuple, Path]] = []
-    for path in files:
-        name_u = path.name.upper()
-        score = (
-            0 if _csv_looks_like_telemetry(path) else 1,
-            0 if "WESENSE" in name_u else 1,
-            1 if "ECG" in name_u else 0,
-            _natural_sort_key(str(path.relative_to(folder)).replace(os.sep, "/")),
-        )
-        scored.append((score, path))
-
-    scored.sort(key=lambda item: item[0])
-    return scored[0][1]
+    try:
+        logger.debug("Found XLS file, converting to CSV: %s", xls_path)
+        csv_path = xls_path.with_suffix(".csv")
+        convert_xls_to_csv(xls_path, csv_path)
+        logger.info("Created CSV from XLS: %s", csv_path)
+        return csv_path
+    except Exception as e:
+        logger.error("Failed to convert XLS to CSV (%s): %s", xls_path, e)
+        return None
 
 
 def find_tasks_log_file(folder: Path) -> Optional[Path]:
