@@ -410,7 +410,8 @@ def find_csv_file(folder: Path) -> Optional[Path]:
     """Return the best telemetry ``.csv`` file found in *folder* recursively.
 
     If no CSV is found, searches for XLS files and automatically converts the
-    best match to CSV using convert_xls_to_csv().
+    best match to CSV using convert_xls_to_csv(). The conversion is transparent
+    to the caller and happens only once per file.
 
     Parameters
     ----------
@@ -420,7 +421,8 @@ def find_csv_file(folder: Path) -> Optional[Path]:
     Returns
     -------
     Optional[Path]
-        Path to the telemetry CSV file, or ``None`` if not found.
+        Path to the telemetry CSV file (either pre-existing or auto-converted
+        from XLS), or ``None`` if neither CSV nor XLS files are found.
     """
     files = _iter_files(folder, "*.csv")
     if files:
@@ -844,14 +846,16 @@ def _normalise_checkpoint_cache_key(cache_key: Optional[str]) -> str:
 def load_telemetry(csv_path: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Load patient metadata and telemetry data from a WESENSE CPET CSV file.
 
-    WESENSE exports begin with a 5-row metadata header (patient info), followed
-    by the column-name row, a units row, and then the time-series data.  This
-    function reads both sections separately.
+    The CSV may be either a pre-existing CSV or one that was automatically
+    converted from XLS by find_csv_file(). WESENSE exports begin with a 5-row
+    metadata header (patient info), followed by the column-name row, a units
+    row, and then the time-series data.  This function reads both sections
+    separately.
 
     Parameters
     ----------
     csv_path : Path
-        Path to the ``.csv`` file.
+        Path to the ``.csv`` file (or auto-converted from ``.xls``).
 
     Returns
     -------

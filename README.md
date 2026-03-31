@@ -39,8 +39,8 @@ used consistently in outputs.
 ```
 data/
 └── Patient 1/                          ← any name; becomes the patient ID
-    ├── WESENSET<id>.xls                ← CPET telemetry export (tab-separated)
-    ├── WESENSET<id>.csv                ← produced by xls_to_csv.py (see below)
+    ├── WESENSET<id>.csv                ← CPET telemetry (preferred)
+    ├── WESENSET<id>.xls                ← or CPET telemetry (auto-converted to CSV)
     ├── WESENSETEST_<id>_L1_ECG*.bdf    ← ECG recording, sensor L1 (optional)
     └── WESENSETEST_<id>_L2_ECG*.bdf    ← ECG recording, sensor L2 (optional)
 ```
@@ -56,13 +56,20 @@ data/
 
 Any extra files in a patient folder (`.dat`, `.log`, etc.) are ignored.
 
-### CPET telemetry file (`.xls` / `.csv`)
+### CPET telemetry file (`.csv` or `.xls`)
 
 The raw export from the WESENSE system is saved as `.xls` but is actually a
-**tab-separated text file** encoded in ISO-8859-1.  Run `xls_to_csv.py` to
-convert it (see [step 1](#1-convert-xls-files-to-csv)).
+**tab-separated text file** encoded in ISO-8859-1. The pipeline automatically
+converts XLS to CSV when needed—just place the files in patient folders and the
+pipeline handles the conversion transparently via `find_csv_file()`.
 
-After conversion the CSV has the following structure:
+If you prefer to convert manually before running the pipeline, use `xls_to_csv.py`:
+
+```bash
+python xls_to_csv.py
+```
+
+After conversion (automatic or manual), the CSV has the following structure:
 
 ```
 Row 0  Identificatie: | <id>  | Naam: | <name> | Voornaam: | <first>
@@ -115,51 +122,48 @@ WESENSETEST_<id>_L2_ECG<anything>.bdf
 # 1. Activate the environment
 conda activate quantitative_analysis
 
-# 2. Place patient folders under ./data  (see Input data format above)
+# 2. Place patient folders under ./data (see Input data format above)
+#    Files can be either .csv or .xls format; the pipeline handles both
 
-# 3. Convert raw .xls exports to CSV
-python xls_to_csv.py
-
-# 4. Run the CPET pipeline (no notebook required)
+# 3. Run the CPET pipeline (automatic XLS conversion if needed)
 python run_pipeline.py --data-root data --output-root output
 
-# 5. (Optional) Run ECG deep-dive for one patient
+# 4. (Optional) Run ECG deep-dive for one patient
 python run_ecg.py --data-root data --output-root output
 ```
 
 Results are written to `./output/`.
 
+**Note**: If you prefer to convert XLS files manually before running the pipeline:
+```bash
+python xls_to_csv.py   # Pre-convert all .xls to .csv (optional)
+```
+
 ---
 
 ## Step-by-step usage
 
-### 1. Convert XLS files to CSV
+### 1. Prepare data (XLS files optional)
 
-The WESENSE device exports tab-separated `.xls` files. Convert them before
-running the analysis scripts:
+The pipeline automatically converts XLS files to CSV during processing, so you can provide either format:
 
 ```bash
-# Convert all .xls files under ./data (skips files that already have a .csv)
+# Option A: Let the pipeline handle XLS → CSV conversion automatically
+# (No manual conversion step needed—just place .xls files in patient folders)
+python run_pipeline.py --data-root data --output-root output
+
+# Option B: Pre-convert XLS files manually (optional)
+# Useful if you want to inspect/validate CSVs before running the pipeline
 python xls_to_csv.py
 
-# Re-convert even if a .csv already exists
-python xls_to_csv.py --overwrite
-
-# Preview what would be converted without writing any files
-python xls_to_csv.py --dry-run
-
-# Use a different data directory
+# With options:
+python xls_to_csv.py --overwrite       # Re-convert even if CSV exists
+python xls_to_csv.py --dry-run         # Preview without writing
 python xls_to_csv.py --data-dir /path/to/data
 ```
 
-The script prints a summary:
-
-```
-  OK     data/Patient 1/WESENSET165653.xls -> data/Patient 1/WESENSET165653.csv
-  SKIP   data/Patient 1/WESENSET144118.xls  (CSV exists; use --overwrite to re-convert)
-
-Done. Converted 1, skipped 1, errors 0.
-```
+**Note**: The pipeline calls `find_csv_file()`, which automatically locates and
+converts XLS files if no CSV is already present. Manual conversion is optional.
 
 ### 2. Convert BDF files to CSV/TSV
 
