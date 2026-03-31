@@ -298,6 +298,48 @@ def _save_patient_ecg_plots(
     pbar.close()
 
 
+def _save_raw_ecg_exports(
+    sensors: Dict[str, Dict[str, object]],
+    patient_id: str,
+    out_dir: Path,
+) -> List[Path]:
+    """Persist full raw ECG samples for dashboard-level inspection.
+
+    Each export contains the full recording for one sensor in a compact
+    long-form layout with ``time_s`` plus the raw ECG and respiration channels
+    converted to microvolts when available.
+    """
+    export_paths: List[Path] = []
+
+    for sensor_label, sensor_info in sensors.items():
+        data = np.asarray(sensor_info["data"], dtype=float)
+        sfreq = float(sensor_info["sfreq"])
+        ch_names = list(sensor_info["ch_names"])
+        if data.ndim != 2 or not ch_names:
+            continue
+
+        time_s = np.arange(data.shape[1], dtype=float) / sfreq
+        raw_df = pd.DataFrame({"time_s": time_s})
+        raw_df.insert(0, "sensor", sensor_label)
+
+        channel_lookup = {name.lower(): idx for idx, name in enumerate(ch_names)}
+        for channel_name, output_name in [("ecg", "ecg_uV"), ("resp", "resp_uV")]:
+            ch_idx = channel_lookup.get(channel_name)
+            if ch_idx is None:
+                continue
+            raw_df[output_name] = data[ch_idx].astype(float) * 1e6
+
+        if raw_df.shape[1] <= 2:
+            continue
+
+        out_path = out_dir / f"{patient_id}_ecg_raw_{sensor_label}.csv.gz"
+        raw_df.to_csv(out_path, index=False, compression="gzip")
+        export_paths.append(out_path)
+        LOGGER.info("Saved raw ECG samples: %s", out_path)
+
+    return export_paths
+
+
 def _run_batch_summary(
     data_root: Path,
     output_root: Path,
@@ -414,6 +456,7 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     ts_all.to_csv(ts_csv, index=False)
     LOGGER.info("Saved ECG timeseries: %s", ts_csv)
+    _save_raw_ecg_exports(sensors, patient_id, out_dir)
 
     summary_columns = [
         "hr_bpm",

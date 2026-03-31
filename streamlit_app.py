@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 import logging
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
+import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
@@ -18,7 +20,37 @@ LOGGER = logging.getLogger(__name__)
 APP_TITLE = "DACIL-WESENSE results dashboard"
 APP_ICON = ":material/monitor_heart:"
 DEFAULT_OUTPUT_ROOT = Path("output")
+DEFAULT_DATA_ROOT = Path("data")
 SPECIAL_OUTPUT_DIRS = {"ecg_analysis", "copd_risk"}
+ECG_OVERVIEW_MAX_POINTS = 8000
+ECG_PHASE_MAX_POINTS = 5000
+TASKS_MARKER_COLUMNS = [
+    "line_number",
+    "timestamp_raw",
+    "timestamp_seconds",
+    "timestamp_datetime",
+    "event_code",
+    "label",
+    "marker_text",
+    "raw_line",
+    "parse_status",
+    "source_file",
+]
+RAW_ECG_OVERVIEW_MAX_POINTS = 12000
+RAW_ECG_DETAIL_MAX_POINTS = 30000
+RAW_ECG_DEFAULT_WINDOW_S = 120
+
+TASK_MARKER_TYPE_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
+    ("Start", ("start on vyntus cpx", "start", "begin")),
+    ("Squat", ("squat", "squats")),
+    ("Vocalisation", ("vocal", "speech", "speaking", "talk", "voice")),
+    ("Breathing", ("breath", "respir", "resp")),
+    ("Rest", ("rest", "recovery", "pause")),
+    ("Warm-up", ("warm up", "warm-up", "opwarmen")),
+    ("Cool-down", ("cool down", "cool-down", "herstel")),
+    ("Walking", ("walk", "walking")),
+    ("Cycling", ("cycle", "cycling", "bike", "bicycle")),
+]
 
 STAGE_COLORS = {
     "Opwarmen": "#1f77b4",
@@ -68,6 +100,25 @@ def _file_token(path: Path) -> tuple[int, int]:
     return stat.st_mtime_ns, stat.st_size
 
 
+def _set_nan(value: object) -> float:
+    """Convert a scalar-like value to float nan-safe."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return number
+
+
+def _clean_text(value: object) -> str:
+    """Return a stripped string or an empty string for missing values."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return ""
+    text = str(value).strip()
+    if text.lower() in {"nan", "none"}:
+        return ""
+    return text
+
+
 def _pick_column(df: pd.DataFrame, candidates: Sequence[str]) -> Optional[str]:
     """Return the first matching column name from ``candidates``."""
     if df.empty:
@@ -97,6 +148,7 @@ def _read_csv(
     fingerprint: tuple[int, int],
     header_rows: tuple[int, ...] = (0,),
     index_col: int | None = None,
+    compression: str | None = None,
 ) -> pd.DataFrame:
     """Read a CSV file with lightweight cache invalidation."""
     path = Path(path_str)
@@ -106,7 +158,12 @@ def _read_csv(
     header_arg: int | list[int]
     header_arg = header_rows[0] if len(header_rows) == 1 else list(header_rows)
     try:
-        return pd.read_csv(path, header=header_arg, index_col=index_col)
+        return pd.read_csv(
+            path,
+            header=header_arg,
+            index_col=index_col,
+            compression=compression,
+        )
     except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError) as exc:
         LOGGER.warning("Could not read CSV '%s': %s", path, exc)
         return pd.DataFrame()
@@ -117,6 +174,7 @@ def _read_optional_csv(
     *,
     header_rows: tuple[int, ...] = (0,),
     index_col: int | None = None,
+    compression: str | None = None,
 ) -> pd.DataFrame:
     """Read a CSV when it exists, otherwise return an empty frame."""
     return _read_csv(
@@ -124,7 +182,226 @@ def _read_optional_csv(
         _file_token(path),
         header_rows=header_rows,
         index_col=index_col,
+        compression=compression,
     )
+
+
+@st.cache_data(show_spinner=False)
+def _read_raw_ecg_export(
+    path_str: str,
+    fingerprint: tuple[int, int],
+) -> pd.DataFrame:
+    """Read a compressed raw ECG export from disk."""
+    path = Path(path_str)
+    if not path.exists():
+        return pd.DataFrame()
+
+    try:
+        frame = pd.read_csv(path, compression="infer")
+    except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError) as exc:
+        LOGGER.warning("Could not read raw ECG export '%s': %s", path, exc)
+        return pd.DataFrame()
+
+    if frame.empty:
+        return frame
+
+    renamed = {col: str(col).strip() for col in frame.columns}
+    frame = frame.rename(columns=renamed)
+    if "sensor" not in frame.columns:
+        frame["sensor"] = _raw_ecg_sensor_label(path)
+    if "time_s" in frame.columns:
+        frame["time_s"] = pd.to_numeric(frame["time_s"], errors="coerce")
+    for candidate in ["ecg_uV", "resp_uV"]:
+        if candidate in frame.columns:
+            frame[candidate] = pd.to_numeric(frame[candidate], errors="coerce")
+    frame = frame.replace([np.inf, -np.inf], np.nan)
+    frame = frame.dropna(subset=["time_s"] if "time_s" in frame.columns else None)
+    return frame.reset_index(drop=True)
+
+
+def _load_raw_ecg_exports(paths: dict[str, Path]) -> pd.DataFrame:
+    """Load all raw ECG exports available for a patient."""
+    frames: list[pd.DataFrame] = []
+    for path in sorted(paths.values(), key=lambda item: item.name):
+        if not path.exists():
+            continue
+        frame = _read_raw_ecg_export(path.as_posix(), _file_token(path))
+        if frame.empty:
+            continue
+        frame = frame.copy()
+        frame["source_file"] = path.name
+        if "sensor" in frame.columns:
+            frame["sensor"] = frame["sensor"].fillna(_raw_ecg_sensor_label(path)).astype(str)
+        else:
+            frame["sensor"] = _raw_ecg_sensor_label(path)
+        frames.append(frame)
+
+    if not frames:
+        return pd.DataFrame(columns=["time_s", "sensor", "source_file"])
+
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    if "time_s" in combined.columns:
+        combined["time_s"] = pd.to_numeric(combined["time_s"], errors="coerce")
+    return combined.replace([np.inf, -np.inf], np.nan).dropna(subset=["time_s"]).reset_index(drop=True)
+
+
+def _downsample_for_plot(df: pd.DataFrame, max_points: int) -> pd.DataFrame:
+    """Keep a manageable number of points for interactive plots."""
+    if df.empty or len(df) <= max_points:
+        return df.copy()
+    step = max(1, len(df) // max_points)
+    return df.iloc[::step].copy()
+
+
+def _normalize_marker_label(row: pd.Series) -> str:
+    """Build a human-readable label for a task marker row."""
+    event_code = _clean_text(row.get("event_code"))
+    label = _clean_text(row.get("label"))
+    marker_text = ", ".join(part for part in [event_code, label] if part)
+    return marker_text or _clean_text(row.get("raw_line")) or "Marker"
+
+
+def _extract_phase_intervals(markers: pd.DataFrame, raw_start: float, raw_end: float) -> pd.DataFrame:
+    """Convert tasks.log markers into displayable phase intervals."""
+    if markers.empty:
+        return pd.DataFrame(
+            columns=["phase", "start_s", "end_s", "duration_s", "event_code", "label", "marker_text"]
+        )
+
+    out = markers.copy()
+    if "timestamp_seconds" not in out.columns:
+        return pd.DataFrame(
+            columns=["phase", "start_s", "end_s", "duration_s", "event_code", "label", "marker_text"]
+        )
+
+    out["timestamp_seconds"] = pd.to_numeric(out["timestamp_seconds"], errors="coerce")
+    out = out.dropna(subset=["timestamp_seconds"]).sort_values("timestamp_seconds").reset_index(drop=True)
+    if out.empty:
+        return pd.DataFrame(
+            columns=["phase", "start_s", "end_s", "duration_s", "event_code", "label", "marker_text"]
+        )
+
+    intervals: list[dict[str, object]] = []
+    active: dict[tuple[str, str], dict[str, object]] = {}
+    non_interval_events = {
+        "metronomeon",
+        "metronomeoff",
+        "experimentended",
+        "experimentend",
+        "end",
+        "start",
+    }
+    for row in out.itertuples(index=False):
+        event_code = _clean_text(getattr(row, "event_code", ""))
+        label = _clean_text(getattr(row, "label", ""))
+        marker_text = _normalize_marker_label(pd.Series(row._asdict()))
+        timestamp = _set_nan(getattr(row, "timestamp_seconds", float("nan")))
+        if not np.isfinite(timestamp):
+            continue
+
+        event_key = event_code.lower()
+        label_key = label.lower()
+        interval_key = (event_key, label_key)
+        is_start = event_key == "start" or event_key.endswith("_start")
+        is_end = event_key == "end" or event_key.endswith("_end")
+        if event_key in {"metronomeon", "metronomeoff"}:
+            is_start = event_key == "metronomeon"
+            is_end = event_key == "metronomeoff"
+
+        if is_start:
+            active[interval_key] = {
+                "phase": label or event_code or marker_text,
+                "start_s": timestamp,
+                "event_code": event_code,
+                "label": label,
+                "marker_text": marker_text,
+            }
+            continue
+
+        if is_end:
+            matched_key = interval_key if interval_key in active else None
+            if matched_key is None:
+                for candidate in list(active):
+                    if candidate[1] == label_key or (label_key and label_key in candidate[1]):
+                        matched_key = candidate
+                        break
+            if matched_key is None:
+                continue
+            interval = active.pop(matched_key)
+            start_s = float(interval["start_s"])
+            end_s = timestamp
+            if end_s <= start_s:
+                continue
+            intervals.append(
+                {
+                    "phase": interval["phase"],
+                    "start_s": max(raw_start, start_s),
+                    "end_s": min(raw_end, end_s),
+                    "duration_s": max(0.0, min(raw_end, end_s) - max(raw_start, start_s)),
+                    "event_code": interval["event_code"],
+                    "label": interval["label"],
+                    "marker_text": interval["marker_text"],
+                }
+            )
+            continue
+
+        if event_key in non_interval_events:
+            continue
+
+        intervals.append(
+            {
+                "phase": label or event_code or marker_text,
+                "start_s": timestamp,
+                "end_s": timestamp,
+                "duration_s": 0.0,
+                "event_code": event_code,
+                "label": label,
+                "marker_text": marker_text,
+            }
+        )
+
+    if not intervals:
+        return pd.DataFrame(
+            columns=["phase", "start_s", "end_s", "duration_s", "event_code", "label", "marker_text"]
+        )
+
+    interval_df = pd.DataFrame(intervals)
+    interval_df = interval_df[interval_df["end_s"] > interval_df["start_s"]].copy()
+    if interval_df.empty:
+        return pd.DataFrame(
+            columns=["phase", "start_s", "end_s", "duration_s", "event_code", "label", "marker_text"]
+        )
+
+    interval_df["phase"] = interval_df["phase"].replace("", "Task")
+    interval_df["start_s"] = pd.to_numeric(interval_df["start_s"], errors="coerce")
+    interval_df["end_s"] = pd.to_numeric(interval_df["end_s"], errors="coerce")
+    interval_df["duration_s"] = pd.to_numeric(interval_df["duration_s"], errors="coerce")
+    interval_df = interval_df.dropna(subset=["start_s", "end_s"]).sort_values("start_s").reset_index(drop=True)
+    interval_df["start_s"] = interval_df["start_s"].clip(lower=raw_start)
+    interval_df["end_s"] = interval_df["end_s"].clip(upper=raw_end)
+    interval_df["duration_s"] = (interval_df["end_s"] - interval_df["start_s"]).clip(lower=0.0)
+    return interval_df
+
+
+def _stage_span_summary(telemetry: pd.DataFrame) -> pd.DataFrame:
+    """Summarize telemetry stage coverage for the patient."""
+    if telemetry.empty or "Stage" not in telemetry.columns:
+        return pd.DataFrame(columns=["phase", "rows", "start_index", "end_index"])
+
+    stage_series = telemetry["Stage"].fillna("Unknown").astype(str)
+    rows: list[dict[str, object]] = []
+    for stage, group in telemetry.groupby(stage_series, dropna=False, sort=False):
+        if group.empty:
+            continue
+        rows.append(
+            {
+                "phase": str(stage),
+                "rows": int(len(group)),
+                "start_index": int(group.index.min()),
+                "end_index": int(group.index.max()),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _flatten_stage_summary(df: pd.DataFrame) -> pd.DataFrame:
@@ -320,6 +597,90 @@ def _format_value(value: object, digits: int = 1) -> str:
     if number.is_integer() and digits == 0:
         return f"{int(number)}"
     return f"{number:.{digits}f}"
+
+
+def _format_elapsed_seconds(seconds: object) -> str:
+    """Format a duration or timestamp offset as ``HH:MM:SS.sss``."""
+    if seconds is None or pd.isna(seconds):
+        return "—"
+
+    total_seconds = float(seconds)
+    sign = "-" if total_seconds < 0 else ""
+    total_seconds = abs(total_seconds)
+    hours, remainder = divmod(total_seconds, 3600.0)
+    minutes, secs = divmod(remainder, 60.0)
+    if hours >= 1:
+        return f"{sign}{int(hours):02d}:{int(minutes):02d}:{secs:06.3f}"
+    return f"{sign}{int(minutes):02d}:{secs:06.3f}"
+
+
+def _downsample_for_plot(
+    df: pd.DataFrame,
+    *,
+    max_points: int,
+    sort_col: str = "time_s",
+) -> pd.DataFrame:
+    """Return a uniformly sampled subset of *df* for chart rendering."""
+    if df.empty or len(df) <= max_points:
+        return df.copy()
+
+    plot_df = df.copy()
+    if sort_col in plot_df.columns:
+        plot_df = plot_df.sort_values(sort_col, kind="stable")
+
+    sample_idx = np.linspace(0, len(plot_df) - 1, num=max_points, dtype=int)
+    sample_idx = np.unique(sample_idx)
+    return plot_df.iloc[sample_idx].copy()
+
+
+def _classify_task_marker(marker_row: pd.Series) -> str:
+    """Derive a human-readable marker type from a parsed tasks row."""
+    parts: list[str] = []
+    for column in ("event_code", "label", "marker_text"):
+        value = marker_row.get(column)
+        if value is None or pd.isna(value):
+            continue
+        text = str(value).strip()
+        if text:
+            parts.append(text)
+
+    normalized = fn._normalize_marker_text(" ".join(parts))
+    if not normalized:
+        return "Other"
+
+    for marker_type, patterns in TASK_MARKER_TYPE_PATTERNS:
+        for pattern in patterns:
+            if pattern in normalized:
+                return marker_type
+
+    event_code = str(marker_row.get("event_code", "")).strip()
+    label = str(marker_row.get("label", "")).strip()
+    if event_code:
+        return event_code.title()
+    if label:
+        return label.title()
+    return "Other"
+
+
+def _raw_ecg_sensor_label(path: Path) -> str:
+    """Return a readable sensor label from a raw ECG export path."""
+    stem = path.stem
+    if "_ecg_raw_" in stem:
+        return stem.split("_ecg_raw_", maxsplit=1)[-1]
+    return stem
+
+
+def _artifact_kind(path: Path) -> str:
+    """Return a readable artifact kind for file inventory tables."""
+    name = path.name.lower()
+    if name.endswith(".csv.gz"):
+        return "csv.gz"
+    if name.endswith(".tsv.gz"):
+        return "tsv.gz"
+    if name.endswith(".json.gz"):
+        return "json.gz"
+    suffix = path.suffix.lower().lstrip(".")
+    return suffix or "file"
 
 
 def _series_value(row: pd.Series, candidates: Sequence[str]) -> object:
@@ -869,8 +1230,8 @@ def _render_stage_summary_section(stage_summary: pd.DataFrame, telemetry: pd.Dat
     st.dataframe(stage_summary, hide_index=True, use_container_width=True)
 
 
-def _render_ecg_section(ecg_timeseries: pd.DataFrame, ecg_summary: pd.DataFrame) -> None:
-    """Render ECG timeseries and summary outputs."""
+def _render_ecg_section(ecg_timeseries: pd.DataFrame, ecg_summary: pd.DataFrame, bundle: dict[str, object]) -> None:
+    """Render ECG timeseries, summary outputs, and raw ECG viewer."""
     if ecg_summary.empty and ecg_timeseries.empty:
         st.info("No ECG analysis files were found for this patient.")
         return
@@ -880,42 +1241,101 @@ def _render_ecg_section(ecg_timeseries: pd.DataFrame, ecg_summary: pd.DataFrame)
 
     if ecg_timeseries.empty:
         st.info("No ECG timeseries export is available.")
-        return
-
-    metric_options = [
-        col
-        for col in ["hr_bpm", "rmssd_ms", "sdnn_ms", "lf_ms2", "hf_ms2", "breathing_rate_bpm"]
-        if col in ecg_timeseries.columns
-    ]
-    if metric_options:
-        chosen_metric = st.selectbox(
-            "ECG timeseries metric",
-            metric_options,
-            index=0,
-            key="ecg_metric_select",
-        )
-        plot_df = ecg_timeseries.copy()
-        plot_df["channel_label"] = plot_df.get("sensor", "sensor").astype(str)
-        if "channel" in plot_df.columns:
-            plot_df["channel_label"] = plot_df["channel_label"] + " - " + plot_df["channel"].astype(str)
-        if "time_s" not in plot_df.columns:
-            plot_df["time_s"] = range(1, len(plot_df) + 1)
-        plot_df[chosen_metric] = pd.to_numeric(plot_df[chosen_metric], errors="coerce")
-        plot_df = plot_df.dropna(subset=[chosen_metric])
-        if not plot_df.empty:
-            fig = px.line(
-                plot_df,
-                x="time_s",
-                y=chosen_metric,
-                color="channel_label",
-                title=chosen_metric,
-                labels={"time_s": "Time (s)", chosen_metric: chosen_metric},
+    else:
+        metric_options = [
+            col
+            for col in ["hr_bpm", "rmssd_ms", "sdnn_ms", "lf_ms2", "hf_ms2", "breathing_rate_bpm"]
+            if col in ecg_timeseries.columns
+        ]
+        if metric_options:
+            chosen_metric = st.selectbox(
+                "ECG timeseries metric",
+                metric_options,
+                index=0,
+                key="ecg_metric_select",
             )
-            fig.update_layout(height=320, margin=dict(l=10, r=10, t=45, b=10))
-            st.plotly_chart(fig, use_container_width=True)
+            plot_df = ecg_timeseries.copy()
+            plot_df["channel_label"] = plot_df.get("sensor", "sensor").astype(str)
+            if "channel" in plot_df.columns:
+                plot_df["channel_label"] = plot_df["channel_label"] + " - " + plot_df["channel"].astype(str)
+            if "time_s" not in plot_df.columns:
+                plot_df["time_s"] = range(1, len(plot_df) + 1)
+            plot_df[chosen_metric] = pd.to_numeric(plot_df[chosen_metric], errors="coerce")
+            plot_df = plot_df.dropna(subset=[chosen_metric])
+            if not plot_df.empty:
+                fig = px.line(
+                    plot_df,
+                    x="time_s",
+                    y=chosen_metric,
+                    color="channel_label",
+                    title=chosen_metric,
+                    labels={"time_s": "Time (s)", chosen_metric: chosen_metric},
+                )
+                fig.update_layout(height=320, margin=dict(l=10, r=10, t=45, b=10))
+                st.plotly_chart(fig, use_container_width=True)
 
-    with st.expander("ECG timeseries table", expanded=False):
-        st.dataframe(ecg_timeseries, hide_index=True, use_container_width=True, height=420)
+        with st.expander("ECG timeseries table", expanded=False):
+            st.dataframe(ecg_timeseries, hide_index=True, use_container_width=True, height=420)
+
+    st.markdown("### Raw ECG Viewer")
+    paths = bundle.get("paths", {})
+    ecg_dir = paths.get("ecg_dir")
+    if ecg_dir and ecg_dir.exists():
+        ecg_exports = {p.name: p for p in ecg_dir.glob("*_ecg_raw_*.csv.gz")}
+        if ecg_exports:
+            raw_df = _load_raw_ecg_exports(ecg_exports)
+            if not raw_df.empty:
+                tasks_markers = bundle.get("tasks_markers", pd.DataFrame())
+                raw_start = float(raw_df["time_s"].min())
+                raw_end = float(raw_df["time_s"].max())
+                phases_df = _extract_phase_intervals(tasks_markers, raw_start, raw_end)
+                
+                phase_options = ["Entire recording"]
+                if not phases_df.empty:
+                    phase_options.extend(phases_df["phase"].tolist())
+                    
+                selected_phase = st.selectbox("Select experimental phase to visualise", phase_options, key="raw_ecg_phase_select")
+                
+                plot_raw_df = raw_df.copy()
+                if selected_phase != "Entire recording":
+                    phase_row = phases_df[phases_df["phase"] == selected_phase].iloc[0]
+                    plot_raw_df = plot_raw_df[(plot_raw_df["time_s"] >= float(phase_row["start_s"])) & (plot_raw_df["time_s"] <= float(phase_row["end_s"]))]
+                    
+                if not plot_raw_df.empty:
+                    filtered_dfs = []
+                    for sensor, group in plot_raw_df.groupby("sensor"):
+                        group = group.sort_values("time_s").copy()
+                        dt = group["time_s"].diff().median()
+                        if pd.notna(dt) and dt > 0:
+                            fs = 1.0 / float(dt)
+                            if "ecg_uV" in group.columns:
+                                group["ecg_uV"] = fn.filter_ecg(group["ecg_uV"].values, fs)
+                            elif "amplitude" in group.columns:
+                                group["amplitude"] = fn.filter_ecg(group["amplitude"].values, fs)
+                        filtered_dfs.append(group)
+                    
+                    if filtered_dfs:
+                        plot_raw_df = pd.concat(filtered_dfs, ignore_index=True)
+                        plot_raw_df = _downsample_for_plot(plot_raw_df, max_points=RAW_ECG_OVERVIEW_MAX_POINTS)
+                        
+                        y_col = "ecg_uV" if "ecg_uV" in plot_raw_df.columns else "amplitude"
+                        if y_col in plot_raw_df.columns:
+                            fig_raw = px.line(
+                                plot_raw_df,
+                                x="time_s",
+                                y=y_col,
+                                color="sensor",
+                                title=f"Filtered ECG ({selected_phase})",
+                                labels={"time_s": "Time (s)", y_col: "Amplitude (uV)"},
+                            )
+                            fig_raw.update_layout(height=400, margin=dict(l=10, r=10, t=45, b=10))
+                            st.plotly_chart(fig_raw, use_container_width=True)
+                else:
+                    st.info(f"No ECG data available for the phase: {selected_phase}")
+        else:
+            st.info("No raw ECG export found. Run pipeline with ECG export enabled.")
+    else:
+        st.info("No ECG directory found.")
 
 
 def _render_validation_section(validation: pd.DataFrame) -> None:
@@ -1152,7 +1572,7 @@ def _render_patient_explorer(
         _render_stage_summary_section(stage_summary, telemetry)
 
     with ecg_tab:
-        _render_ecg_section(ecg_timeseries, ecg_summary)
+        _render_ecg_section(ecg_timeseries, ecg_summary, bundle)
         image_subset = [path for path in image_paths if path.name.startswith(patient_id) and "ecg" in path.name.lower()]
         if image_subset:
             with st.container(border=True):

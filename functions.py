@@ -628,6 +628,52 @@ def parse_tasks_log(tasks_log_path: Path) -> pd.DataFrame:
             if not stripped or stripped.startswith("#") or stripped.startswith("//"):
                 continue
 
+            csv_row: Optional[List[str]] = None
+            try:
+                csv_row = next(csv.reader([stripped]))
+            except csv.Error:
+                csv_row = None
+
+            if csv_row is not None and len(csv_row) >= 5 and csv_row[0].strip().count("-") == 2:
+                date_raw, time_raw, unix_raw, event_raw, task_raw = [cell.strip() for cell in csv_row[:5]]
+                seconds_value, datetime_value = _parse_tasks_timestamp(unix_raw or time_raw or date_raw)
+                if seconds_value is None and datetime_value is None:
+                    seconds_value, datetime_value = _parse_tasks_timestamp(time_raw)
+
+                timestamp_seconds = float(seconds_value) if seconds_value is not None else float("nan")
+                timestamp_datetime = datetime_value
+                if timestamp_datetime is None and date_raw and time_raw:
+                    timestamp_datetime = pd.to_datetime(
+                        f"{date_raw} {time_raw}",
+                        format="%Y-%m-%d %H:%M:%S:%f",
+                        errors="coerce",
+                        utc=True,
+                    )
+                    if pd.isna(timestamp_datetime):
+                        timestamp_datetime = None
+                    elif hasattr(timestamp_datetime, "to_pydatetime"):
+                        timestamp_datetime = timestamp_datetime.to_pydatetime()
+
+                marker_text = ", ".join(part for part in [event_raw, task_raw] if part).strip()
+                if not marker_text:
+                    marker_text = stripped
+
+                records.append(
+                    {
+                        "line_number": line_number,
+                        "timestamp_raw": time_raw or date_raw or unix_raw,
+                        "timestamp_seconds": timestamp_seconds,
+                        "timestamp_datetime": timestamp_datetime,
+                        "event_code": event_raw,
+                        "label": task_raw,
+                        "marker_text": marker_text,
+                        "raw_line": stripped,
+                        "parse_status": "ok",
+                        "source_file": str(tasks_log_path),
+                    }
+                )
+                continue
+
             tokens = [tok.strip() for tok in _TASKS_LOG_SPLIT_RE.split(stripped) if tok.strip()]
             if not tokens or _looks_like_tasks_header(tokens):
                 continue
@@ -703,6 +749,12 @@ def parse_tasks_log(tasks_log_path: Path) -> pd.DataFrame:
         missing_seconds = valid_datetime & markers_df["timestamp_seconds"].isna()
         markers_df.loc[missing_seconds, "timestamp_seconds"] = datetime_seconds.loc[missing_seconds]
 
+    markers_df = markers_df.sort_values(
+        by=["timestamp_seconds", "line_number"],
+        kind="stable",
+        na_position="last",
+    ).reset_index(drop=True)
+
     logger.info(
         "Parsed %d marker row(s) from '%s'.",
         len(markers_df),
@@ -732,12 +784,19 @@ def _build_tasks_marker_match_mask(
     target_event = _normalize_marker_text(event_code)
     target_label = _normalize_marker_text(label_contains)
 
-    has_event = event_norm.eq(target_event) | text_norm.str.contains(
-        target_event, regex=False, na=False
-    )
-    has_label = label_norm.str.contains(target_label, regex=False, na=False) | text_norm.str.contains(
-        target_label, regex=False, na=False
-    )
+    if target_event:
+        has_event = event_norm.eq(target_event) | text_norm.str.contains(
+            target_event, regex=False, na=False
+        )
+    else:
+        has_event = pd.Series(True, index=markers_df.index, dtype=bool)
+
+    if target_label:
+        has_label = label_norm.str.contains(target_label, regex=False, na=False) | text_norm.str.contains(
+            target_label, regex=False, na=False
+        )
+    else:
+        has_label = pd.Series(True, index=markers_df.index, dtype=bool)
     return has_event & has_label
 
 
@@ -943,13 +1002,19 @@ def _parse_telemetry(df: pd.DataFrame) -> pd.DataFrame:
 
     df.reset_index(drop=True, inplace=True)
     
-    # Convert numeric columns (except Stage) to numeric, replacing commas with periods
+    time_columns = {str(name).strip().lower() for name in TELEMETRY_TIME_CANDIDATES}
+
+    # Convert numeric columns (except Stage and time-like columns) to numeric,
+    # replacing commas with periods.  Time-like columns are preserved so the
+    # downstream breathing-rate validation can still parse the original clock
+    # values.
     for col in df.columns:
-        if col != "Stage":
-            df[col] = pd.to_numeric(
-                df[col].astype(str).str.replace(",", ".", regex=False),
-                errors="coerce"
-            )
+        if col == "Stage" or str(col).strip().lower() in time_columns:
+            continue
+        df[col] = pd.to_numeric(
+            df[col].astype(str).str.replace(",", ".", regex=False),
+            errors="coerce"
+        )
     
     return df
 
@@ -1171,7 +1236,12 @@ def extract_ecg_timeseries(
 
             # EDR breathing rate from R-peak amplitudes.
             win_amps = full_signal[win_peaks]
-            br_bpm = _estimate_breathing_rate_from_ecg(win_peaks, win_amps, sfreq)
+            br_bpm = _estimate_breathing_rate_from_ecg(
+                win_peaks,
+                win_amps,
+                sfreq,
+                signal_1d=full_signal,
+            )
 
             rows.append(
                 dict(
@@ -1270,7 +1340,12 @@ def extract_ecg_timeseries_array(
 
             hrv = _compute_hrv_metrics(rr_ms)
             win_amps = full_signal[win_peaks]
-            br_bpm = _estimate_breathing_rate_from_ecg(win_peaks, win_amps, sfreq)
+            br_bpm = _estimate_breathing_rate_from_ecg(
+                win_peaks,
+                win_amps,
+                sfreq,
+                signal_1d=full_signal,
+            )
 
             rows.append(
                 dict(
@@ -1853,8 +1928,8 @@ def _estimate_hr_from_signal(signal: np.ndarray, sfreq: float) -> float:
         failure.
     """
     try:
-        # Band-pass rough filtering using diff as a quick proxy.
-        diff_signal = np.diff(signal)
+        filtered_signal = filter_ecg(signal, sfreq)
+        diff_signal = np.diff(filtered_signal)
 
         # Compute autocorrelation via FFT: O(n log n) vs O(n²) for np.correlate.
         if _USE_GPU:
@@ -1887,6 +1962,20 @@ def _estimate_hr_from_signal(signal: np.ndarray, sfreq: float) -> float:
         return float("nan")
 
 
+def _prepare_ecg_qrs_components(
+    signal_1d: np.ndarray,
+    sfreq: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return a cleaned ECG signal plus a QRS-enhanced view.
+
+    Reuses the shared ECG filtering pipeline so R-peak detection and breathing
+    estimation operate on the same baseline-corrected, mains-suppressed signal.
+    """
+    cleaned = filter_ecg(signal_1d, sfreq)
+    qrs_signal = _bandpass_filter(cleaned, sfreq, lowcut=5.0, highcut=15.0)
+    return cleaned, qrs_signal
+
+
 def _detect_r_peaks(signal_1d: np.ndarray, sfreq: float) -> np.ndarray:
     """Detect R-peak positions in a 1-D ECG signal.
 
@@ -1903,20 +1992,49 @@ def _detect_r_peaks(signal_1d: np.ndarray, sfreq: float) -> np.ndarray:
         Integer array of sample indices where R-peaks were detected.
     """
     try:
-        # Band-pass 5–40 Hz to isolate the QRS complex.
-        low, high = 5.0 / (0.5 * sfreq), 40.0 / (0.5 * sfreq)
-        low = max(1e-4, min(low, 0.999))
-        high = max(low + 1e-4, min(high, 0.999))
-        b, a = sp_signal.butter(2, [low, high], btype="band")
-        filtered = sp_signal.filtfilt(b, a, signal_1d)
+        cleaned, qrs_signal = _prepare_ecg_qrs_components(signal_1d, sfreq)
 
-        # Rectify and detect peaks.
-        min_dist = int(0.3 * sfreq)  # 200 bpm upper limit
-        threshold = 0.3 * float(np.max(np.abs(filtered)))
-        peaks, _ = sp_signal.find_peaks(
-            np.abs(filtered), distance=min_dist, height=threshold
+        derivative = np.diff(qrs_signal, prepend=qrs_signal[0])
+        energy = derivative * derivative
+        window = max(1, int(round(0.12 * sfreq)))
+        integrated = sp_signal.convolve(
+            energy,
+            np.ones(window, dtype=float) / window,
+            mode="same",
         )
-        return peaks
+        baseline = float(np.median(integrated))
+        spread = float(np.median(np.abs(integrated - baseline)))
+        peaks, _ = sp_signal.find_peaks(
+            integrated,
+            distance=int(0.30 * sfreq),
+            height=baseline + 3.5 * spread,
+            prominence=max(spread * 0.5, 1e-12),
+        )
+        if peaks.size == 0:
+            rectified = np.abs(qrs_signal)
+            rectified_baseline = float(np.median(rectified))
+            rectified_spread = float(np.median(np.abs(rectified - rectified_baseline)))
+            peaks, _ = sp_signal.find_peaks(
+                rectified,
+                distance=int(0.30 * sfreq),
+                height=rectified_baseline + 2.5 * rectified_spread,
+                prominence=max(rectified_spread * 0.5, 1e-12),
+            )
+        if peaks.size == 0:
+            return np.array([], dtype=int)
+
+        refined: List[int] = []
+        half_width = max(1, int(round(0.08 * sfreq)))
+        for peak_idx in peaks:
+            start = max(0, int(peak_idx) - half_width)
+            stop = min(len(cleaned), int(peak_idx) + half_width + 1)
+            local = np.abs(cleaned[start:stop])
+            if local.size == 0:
+                continue
+            refined.append(start + int(np.argmax(local)))
+        if not refined:
+            return np.array([], dtype=int)
+        return np.unique(np.asarray(refined, dtype=int))
     except Exception:
         return np.array([], dtype=int)
 
@@ -1984,15 +2102,261 @@ def _compute_hrv_metrics(rr_ms: np.ndarray) -> Dict[str, float]:
     return result
 
 
+
+def _dominant_breathing_frequency_from_series(
+    times: np.ndarray,
+    values: np.ndarray,
+    *,
+    target_fs: float = 5.0,
+    low_hz: float = 0.05,
+    high_hz: float = 1.0,
+) -> Tuple[float, float]:
+    """Estimate the dominant breathing frequency in a resampled series.
+
+    Parameters
+    ----------
+    times : np.ndarray
+        Sample timestamps in seconds.
+    values : np.ndarray
+        Sample values to analyse.
+    target_fs : float
+        Uniform resampling rate used before spectral estimation.
+    low_hz : float
+        Lower bound of the respiratory frequency band.
+    high_hz : float
+        Upper bound of the respiratory frequency band.
+
+    Returns
+    -------
+    Tuple[float, float]
+        ``(breathing_bpm, spectral_ratio)`` where ``spectral_ratio`` is the
+        ratio between the dominant band power and the median band power.
+        ``float('nan')`` values indicate failure.
+    """
+    nan = float("nan")
+    times = np.asarray(times, dtype=float)
+    values = np.asarray(values, dtype=float)
+    if times.size < 8 or values.size < 8 or times.size != values.size:
+        return nan, nan
+
+    finite_mask = np.isfinite(times) & np.isfinite(values)
+    times = times[finite_mask]
+    values = values[finite_mask]
+    if times.size < 8:
+        return nan, nan
+
+    order = np.argsort(times)
+    times = times[order]
+    values = values[order]
+
+    if np.any(np.diff(times) <= 0):
+        dedup_times: List[float] = []
+        dedup_values: List[float] = []
+        start = 0
+        while start < len(times):
+            stop = start + 1
+            while stop < len(times) and times[stop] == times[start]:
+                stop += 1
+            dedup_times.append(float(times[start]))
+            dedup_values.append(float(np.mean(values[start:stop])))
+            start = stop
+        times = np.asarray(dedup_times, dtype=float)
+        values = np.asarray(dedup_values, dtype=float)
+
+    if times.size < 8 or not np.isfinite(times[0]) or not np.isfinite(times[-1]):
+        return nan, nan
+
+    duration_s = float(times[-1] - times[0])
+    if duration_s <= 0:
+        return nan, nan
+
+    step = 1.0 / float(target_fs)
+    time_grid = np.arange(times[0], times[-1], step)
+    if time_grid.size < 8:
+        return nan, nan
+
+    try:
+        interp_kind = "cubic" if np.unique(times).size >= 4 else "linear"
+        interpolator = interp1d(
+            times,
+            values,
+            kind=interp_kind,
+            fill_value="extrapolate",
+            assume_sorted=True,
+        )
+        uniform = np.asarray(interpolator(time_grid), dtype=float)
+    except Exception:
+        try:
+            interpolator = interp1d(
+                times,
+                values,
+                kind="linear",
+                fill_value="extrapolate",
+                assume_sorted=True,
+            )
+            uniform = np.asarray(interpolator(time_grid), dtype=float)
+        except Exception:
+            return nan, nan
+
+    if uniform.size < 8 or not np.isfinite(uniform).any():
+        return nan, nan
+
+    uniform = sp_signal.detrend(uniform, type="linear")
+    if high_hz > low_hz and target_fs > 2.0 * high_hz:
+        try:
+            uniform = _bandpass_filter(uniform, target_fs, lowcut=low_hz, highcut=high_hz)
+        except Exception:
+            pass
+
+    uniform_std = float(np.std(uniform))
+    if uniform_std <= 0 or not np.isfinite(uniform_std):
+        return nan, nan
+    uniform = (uniform - float(np.mean(uniform))) / uniform_std
+
+    nperseg = min(len(uniform), 256)
+    if nperseg < 8:
+        return nan, nan
+
+    freqs, psd = sp_signal.welch(uniform, fs=target_fs, nperseg=nperseg)
+    band_mask = (freqs >= low_hz) & (freqs <= high_hz)
+    if not band_mask.any():
+        return nan, nan
+
+    band_freqs = freqs[band_mask]
+    band_psd = psd[band_mask]
+    finite_band = np.isfinite(band_psd)
+    if not finite_band.any():
+        return nan, nan
+
+    dominant_idx = int(np.argmax(np.where(finite_band, band_psd, -np.inf)))
+    dominant_freq = float(band_freqs[dominant_idx])
+    dominant_power = float(band_psd[dominant_idx])
+    band_floor = float(np.median(band_psd[finite_band]))
+    spectral_ratio = dominant_power / (band_floor + 1e-12)
+    return dominant_freq * 60.0, spectral_ratio
+
+
+def _select_breathing_candidate(
+    candidates: List[Dict[str, float]],
+    *,
+    group_tolerance_bpm: float = 2.0,
+) -> float:
+    """Select the most plausible breathing-rate candidate from a set."""
+    if not candidates:
+        return float("nan")
+
+    valid = [
+        candidate
+        for candidate in candidates
+        if np.isfinite(candidate.get("bpm", float("nan")))
+    ]
+    if not valid:
+        return float("nan")
+
+    ordered = sorted(valid, key=lambda item: float(item["bpm"]))
+    groups: List[List[Dict[str, float]]] = [[ordered[0]]]
+    for candidate in ordered[1:]:
+        current_group = groups[-1]
+        if float(candidate["bpm"]) - float(current_group[-1]["bpm"]) <= group_tolerance_bpm:
+            current_group.append(candidate)
+        else:
+            groups.append([candidate])
+
+    def _group_key(group: List[Dict[str, float]]) -> Tuple[float, float, float, float]:
+        weight = float(sum(float(item.get("weight", 1.0)) for item in group))
+        count = float(len(group))
+        median_bpm = float(np.median([float(item["bpm"]) for item in group]))
+        median_score = float(
+            np.median([float(item.get("score", 0.0)) for item in group])
+        )
+        # Prefer the strongest weighted cluster, then the most supported group,
+        # then a cluster with a stronger spectral signature and plausible
+        # respiratory centre.
+        return (weight, count, median_score, -abs(median_bpm - 15.0))
+
+    best_group = max(groups, key=_group_key)
+    return float(np.median([float(item["bpm"]) for item in best_group]))
+
+
+def _extract_qs_morphology(
+    cleaned_signal: np.ndarray,
+    r_peak_indices: np.ndarray,
+    sfreq: float,
+    window_s: float = 0.12,
+) -> Dict[str, np.ndarray]:
+    """Extract Q/S morphology around each detected R peak.
+
+    Q and S peaks are approximated as the local minima before and after each
+    R peak inside a symmetric window. The output arrays remain aligned to the
+    original R-peak order and expose a ``valid_mask`` for downstream filtering.
+    """
+    cleaned = np.asarray(cleaned_signal, dtype=float).squeeze()
+    r_peak_indices = np.asarray(r_peak_indices, dtype=int)
+    n_peaks = int(len(r_peak_indices))
+
+    output = {
+        "q_indices": np.full(n_peaks, -1, dtype=int),
+        "s_indices": np.full(n_peaks, -1, dtype=int),
+        "q_amplitudes": np.full(n_peaks, np.nan, dtype=float),
+        "s_amplitudes": np.full(n_peaks, np.nan, dtype=float),
+        "rs_central_moment": np.full(n_peaks, np.nan, dtype=float),
+        "valid_mask": np.zeros(n_peaks, dtype=bool),
+    }
+
+    if cleaned.ndim != 1 or cleaned.size == 0 or n_peaks == 0 or sfreq <= 0:
+        return output
+
+    search_samples = max(1, int(round(window_s * sfreq)))
+    for idx, r_idx in enumerate(r_peak_indices):
+        if r_idx < 0 or r_idx >= cleaned.size:
+            continue
+
+        q_start = max(0, int(r_idx) - search_samples)
+        q_stop = int(r_idx)
+        q_segment = cleaned[q_start:q_stop]
+        if q_segment.size == 0:
+            continue
+        q_idx = q_start + int(np.argmin(q_segment))
+
+        s_start = min(cleaned.size, int(r_idx) + 1)
+        s_stop = min(cleaned.size, int(r_idx) + search_samples + 1)
+        s_segment = cleaned[s_start:s_stop]
+        if s_segment.size == 0:
+            continue
+        s_idx = s_start + int(np.argmin(s_segment))
+        if s_idx <= q_idx:
+            continue
+
+        output["q_indices"][idx] = q_idx
+        output["s_indices"][idx] = s_idx
+        output["q_amplitudes"][idx] = float(cleaned[q_idx])
+        output["s_amplitudes"][idx] = float(cleaned[s_idx])
+
+        rs_segment = cleaned[int(r_idx) : s_idx + 1]
+        if rs_segment.size >= 3:
+            centered = rs_segment - float(np.mean(rs_segment))
+            output["rs_central_moment"][idx] = float(np.mean(centered ** 4))
+
+        output["valid_mask"][idx] = True
+
+    return output
+
+
+
 def _estimate_breathing_rate_from_ecg(
     r_peak_indices: np.ndarray,
     r_amplitudes: np.ndarray,
     sfreq: float,
+    signal_1d: Optional[np.ndarray] = None,
 ) -> float:
     """Estimate breathing rate from ECG-derived respiration (EDR).
 
-    Uses the amplitude modulation of R-peaks (a well-established proxy for
-    respiratory effort) to extract the dominant breathing frequency.
+    The estimator evaluates several EDR surrogates and then chooses the most
+    plausible respiratory rhythm from the resulting cluster of candidates. The
+    paper-informed morphology surrogates (R-to-Q amplitude, R-to-S amplitude,
+    RS central moment, QRS area, and QQ area) are combined with the older
+    filtered amplitude and RR-interval fallbacks so the result remains usable
+    on both clean and noisier recordings.
 
     Parameters
     ----------
@@ -2002,6 +2366,10 @@ def _estimate_breathing_rate_from_ecg(
         Signal amplitude at each R-peak (same length as *r_peak_indices*).
     sfreq : float
         Sampling frequency of the original ECG signal in Hz.
+    signal_1d : Optional[np.ndarray]
+        Full ECG signal for the current window. When provided, the estimator
+        can derive filtered-amplitude and morphology candidates directly from
+        the recording instead of relying on peak amplitudes alone.
 
     Returns
     -------
@@ -2013,27 +2381,201 @@ def _estimate_breathing_rate_from_ecg(
         return float("nan")
 
     try:
-        # Times of each R-peak in seconds.
         r_times = r_peak_indices / sfreq
+        candidates: List[Dict[str, float]] = []
+        amplitude_series = np.asarray(r_amplitudes, dtype=float)
+        cleaned_signal: Optional[np.ndarray] = None
 
-        # Resample amplitude envelope to 4 Hz.
-        target_fs = 4.0
-        t_uniform = np.arange(r_times[0], r_times[-1], 1.0 / target_fs)
-        if len(t_uniform) < 8:
-            return float("nan")
+        if signal_1d is not None:
+            signal = np.asarray(signal_1d, dtype=float).squeeze()
+            if signal.ndim == 1 and signal.size > int(np.max(r_peak_indices)):
+                try:
+                    cleaned_signal = filter_ecg(signal, sfreq)
+                    if cleaned_signal.size > int(np.max(r_peak_indices)):
+                        amplitude_series = cleaned_signal[r_peak_indices]
+                except Exception:
+                    cleaned_signal = None
 
-        interp = interp1d(r_times, r_amplitudes, kind="linear", fill_value="extrapolate")
-        env_uniform = interp(t_uniform)
+        raw_freq_bpm, raw_score = _dominant_breathing_frequency_from_series(
+            r_times,
+            amplitude_series,
+        )
+        if np.isfinite(raw_freq_bpm):
+            candidates.append(
+                {
+                    "source": "raw_amplitude",
+                    "bpm": float(raw_freq_bpm),
+                    "score": float(raw_score if np.isfinite(raw_score) else 0.0),
+                    "weight": 0.1,
+                }
+            )
 
-        # Welch PSD; look for dominant peak in the breathing band (0.1–0.5 Hz = 6–30 bpm).
-        freqs, psd = sp_signal.welch(env_uniform, fs=target_fs, nperseg=min(len(env_uniform), 64))
-        breath_mask = (freqs >= 0.1) & (freqs <= 0.5)
-        if not breath_mask.any():
-            return float("nan")
+        if cleaned_signal is not None:
+            filtered = _bandpass_filter(cleaned_signal, sfreq, 5.0, 15.0)
+            peak_values = filtered[r_peak_indices]
 
-        dominant_idx = int(np.argmax(psd[breath_mask]))
-        dominant_freq = freqs[breath_mask][dominant_idx]
-        return float(dominant_freq * 60.0)
+            filt_freq_bpm, filt_score = _dominant_breathing_frequency_from_series(
+                r_times,
+                peak_values,
+            )
+            if np.isfinite(filt_freq_bpm):
+                candidates.append(
+                    {
+                        "source": "filtered_amplitude",
+                        "bpm": float(filt_freq_bpm),
+                        "score": float(filt_score if np.isfinite(filt_score) else 0.0),
+                        "weight": 0.5,
+                    }
+                )
+
+            abs_freq_bpm, abs_score = _dominant_breathing_frequency_from_series(
+                r_times,
+                np.abs(peak_values),
+            )
+            if np.isfinite(abs_freq_bpm):
+                candidates.append(
+                    {
+                        "source": "absolute_filtered_amplitude",
+                        "bpm": float(abs_freq_bpm),
+                        "score": float(abs_score if np.isfinite(abs_score) else 0.0),
+                        "weight": 0.5,
+                    }
+                )
+
+            morphology = _extract_qs_morphology(cleaned_signal, r_peak_indices, sfreq)
+            valid_mask = morphology["valid_mask"] & np.isfinite(amplitude_series)
+
+            if np.count_nonzero(valid_mask) >= 8:
+                valid_times = r_times[valid_mask]
+                valid_r_amplitudes = amplitude_series[valid_mask]
+                q_amplitudes = morphology["q_amplitudes"][valid_mask]
+                s_amplitudes = morphology["s_amplitudes"][valid_mask]
+                rs_moment = morphology["rs_central_moment"][valid_mask]
+
+                rq_values = valid_r_amplitudes - q_amplitudes
+                rs_values = valid_r_amplitudes - s_amplitudes
+
+                rq_freq_bpm, rq_score = _dominant_breathing_frequency_from_series(
+                    valid_times,
+                    rq_values,
+                )
+                if np.isfinite(rq_freq_bpm):
+                    candidates.append(
+                        {
+                            "source": "r_to_q_amplitude",
+                            "bpm": float(rq_freq_bpm),
+                            "score": float(rq_score if np.isfinite(rq_score) else 0.0),
+                            "weight": 5.0,
+                        }
+                    )
+
+                rs_freq_bpm, rs_score = _dominant_breathing_frequency_from_series(
+                    valid_times,
+                    rs_values,
+                )
+                if np.isfinite(rs_freq_bpm):
+                    candidates.append(
+                        {
+                            "source": "r_to_s_amplitude",
+                            "bpm": float(rs_freq_bpm),
+                            "score": float(rs_score if np.isfinite(rs_score) else 0.0),
+                            "weight": 5.0,
+                        }
+                    )
+
+                cm_freq_bpm, cm_score = _dominant_breathing_frequency_from_series(
+                    valid_times,
+                    rs_moment,
+                )
+                if np.isfinite(cm_freq_bpm):
+                    candidates.append(
+                        {
+                            "source": "central_moment_rs",
+                            "bpm": float(cm_freq_bpm),
+                            "score": float(cm_score if np.isfinite(cm_score) else 0.0),
+                            "weight": 4.0,
+                        }
+                    )
+
+                q_indices = morphology["q_indices"][valid_mask]
+                s_indices = morphology["s_indices"][valid_mask]
+
+                qrs_area_values: List[float] = []
+                qrs_area_times: List[float] = []
+                for beat_time, q_idx, s_idx in zip(valid_times, q_indices, s_indices):
+                    if q_idx < 0 or s_idx <= q_idx:
+                        continue
+                    segment = cleaned_signal[q_idx : s_idx + 1]
+                    if segment.size < 2:
+                        continue
+                    qrs_area_values.append(float(np.trapz(segment, dx=1.0 / sfreq)))
+                    qrs_area_times.append(float(beat_time))
+
+                if len(qrs_area_values) >= 8:
+                    qrs_area_freq_bpm, qrs_area_score = _dominant_breathing_frequency_from_series(
+                        np.asarray(qrs_area_times, dtype=float),
+                        np.asarray(qrs_area_values, dtype=float),
+                    )
+                    if np.isfinite(qrs_area_freq_bpm):
+                        candidates.append(
+                            {
+                                "source": "qrs_area",
+                                "bpm": float(qrs_area_freq_bpm),
+                                "score": float(
+                                    qrs_area_score if np.isfinite(qrs_area_score) else 0.0
+                                ),
+                                "weight": 0.5,
+                            }
+                        )
+
+                qq_area_values: List[float] = []
+                qq_area_times: List[float] = []
+                q_pairs = q_indices[q_indices >= 0]
+                if len(q_pairs) >= 2:
+                    for left_q, right_q in zip(q_pairs[:-1], q_pairs[1:]):
+                        if right_q <= left_q:
+                            continue
+                        segment = cleaned_signal[left_q : right_q + 1]
+                        if segment.size < 2:
+                            continue
+                        qq_area_values.append(float(np.trapz(segment, dx=1.0 / sfreq)))
+                        qq_area_times.append(float((left_q + right_q) / (2.0 * sfreq)))
+
+                if len(qq_area_values) >= 8:
+                    qq_area_freq_bpm, qq_area_score = _dominant_breathing_frequency_from_series(
+                        np.asarray(qq_area_times, dtype=float),
+                        np.asarray(qq_area_values, dtype=float),
+                    )
+                    if np.isfinite(qq_area_freq_bpm):
+                        candidates.append(
+                            {
+                                "source": "qq_area",
+                                "bpm": float(qq_area_freq_bpm),
+                                "score": float(
+                                    qq_area_score if np.isfinite(qq_area_score) else 0.0
+                                ),
+                                "weight": 0.5,
+                            }
+                        )
+
+        if len(r_peak_indices) >= 9:
+            rr_times = r_times[1:]
+            rr_ms = np.diff(r_peak_indices) / sfreq * 1000.0
+            rr_freq_bpm, rr_score = _dominant_breathing_frequency_from_series(
+                rr_times,
+                rr_ms,
+            )
+            if np.isfinite(rr_freq_bpm):
+                candidates.append(
+                    {
+                        "source": "rr_interval",
+                        "bpm": float(rr_freq_bpm),
+                        "score": float(rr_score if np.isfinite(rr_score) else 0.0),
+                        "weight": 0.1,
+                    }
+                )
+
+        return _select_breathing_candidate(candidates)
     except Exception:
         return float("nan")
 
@@ -2281,20 +2823,20 @@ def process_patient(
             )
             marker_start_seconds = find_tasks_marker_timestamp(
                 tasks_markers_df,
-                event_code="start",
-                label_contains="start on vyntus cpx",
+                event_code="end",
+                label_contains="Start on Vyntus CPX",
             )
             marker_start_found = marker_start_seconds is not None
 
             if marker_start_found:
                 logger.info(
-                    "%s: using tasks marker start,Start on Vyntus CPX at %.3f s.",
+                    "%s: using tasks marker end,Start on Vyntus CPX at %.3f s.",
                     patient_id,
                     float(marker_start_seconds),
                 )
             else:
                 logger.warning(
-                    "%s: marker 'start,Start on Vyntus CPX' not found or missing timestamp; "
+                    "%s: marker 'end,Start on Vyntus CPX' not found or missing timestamp; "
                     "ECG will not be trimmed.",
                     patient_id,
                 )
@@ -3479,6 +4021,15 @@ def build_patient_summary(
             row["mean_breathing_rate_bpm_edr"] = float(calculated_mean)
         if pd.notna(measured_mean):
             row["mean_breathing_rate_bpm_cpet"] = float(measured_mean)
+        if pd.notna(calculated_mean) and pd.notna(measured_mean):
+            row["breathing_rate_delta_bpm"] = float(calculated_mean - measured_mean)
+            row["breathing_rate_abs_delta_bpm"] = float(abs(calculated_mean - measured_mean))
+        else:
+            row["breathing_rate_delta_bpm"] = float("nan")
+            row["breathing_rate_abs_delta_bpm"] = float("nan")
+    else:
+        row["breathing_rate_delta_bpm"] = float("nan")
+        row["breathing_rate_abs_delta_bpm"] = float("nan")
 
     # --- tasks.log marker summary ---
     if tasks_metrics:
@@ -3526,6 +4077,8 @@ def build_patient_analysis_status_table(summary_df: pd.DataFrame) -> pd.DataFram
         "mean_sdnn_ms",
         "mean_breathing_rate_bpm_edr",
         "mean_breathing_rate_bpm_cpet",
+        "breathing_rate_delta_bpm",
+        "breathing_rate_abs_delta_bpm",
         "breathing_rate_mae_bpm",
     ]
     if summary_df.empty:
@@ -3594,6 +4147,8 @@ def build_patient_analysis_status_table(summary_df: pd.DataFrame) -> pd.DataFram
         ]
     )
     breathing_rate_mae_bpm = _pick_numeric(["breathing_rate_mae_bpm"])
+    breathing_rate_delta_bpm = _pick_numeric(["breathing_rate_delta_bpm"])
+    breathing_rate_abs_delta_bpm = _pick_numeric(["breathing_rate_abs_delta_bpm"])
     tasks_markers_parsed_count = _pick_numeric(["tasks_markers_parsed"]).fillna(0.0)
 
     validation_status_col = _find_column(summary_df, ["breathing_rate_validation_status"])
@@ -3636,6 +4191,8 @@ def build_patient_analysis_status_table(summary_df: pd.DataFrame) -> pd.DataFram
     table["mean_sdnn_ms"] = mean_sdnn_ms
     table["mean_breathing_rate_bpm_edr"] = mean_breathing_rate_bpm_edr
     table["mean_breathing_rate_bpm_cpet"] = mean_breathing_rate_bpm_cpet
+    table["breathing_rate_delta_bpm"] = breathing_rate_delta_bpm
+    table["breathing_rate_abs_delta_bpm"] = breathing_rate_abs_delta_bpm
     table["breathing_rate_mae_bpm"] = breathing_rate_mae_bpm
 
     table = (
